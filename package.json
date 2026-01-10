@@ -1,5 +1,5 @@
 {
-  "name": "ikrautas-invoices-batch-ui",
+  "name": "ikrautas-batch-verifier",
   "version": "1.0.0",
   "private": true,
   "type": "module",
