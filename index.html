@@ -109,6 +109,7 @@
     dateEl.value = `${now.getUTCFullYear()}-${String(now.getUTCMonth()+1).padStart(2,'0')}-${String(now.getUTCDate()).padStart(2,'0')}`;
 
     let lastCheck = null;
+    let msalInstance = null;
 
     function setStatus(text, ok=null) {
       statusPill.textContent = text;
@@ -148,9 +149,9 @@
         ${list.length > 200 ? `<div class="muted">Showing first 200 of ${list.length}</div>` : ''}`;
     }
 
-    // --- MSAL INIT (wait a tick in case fallback is still loading) ---
+    // --- MSAL BOOT ---
     async function bootMsal() {
-      // wait a bit for fallback loader to finish if needed
+      // Wait briefly for fallback loader if needed
       for (let i = 0; i < 40; i++) {
         if (window.msal) break;
         await new Promise(r => setTimeout(r, 50));
@@ -170,37 +171,38 @@
         return;
       }
 
-      const msalConfig = {
+      const config = {
         auth: {
           clientId: MS_CLIENT_ID,
           authority: `https://login.microsoftonline.com/${MS_TENANT_ID}`,
           redirectUri: window.location.origin + "/",
+          // keep default true, but explicit:
+          navigateToLoginRequestUrl: true,
         },
         cache: { cacheLocation: "localStorage" },
       };
+
+      msalInstance = new msal.PublicClientApplication(config);
+
+      if (typeof msalInstance.initialize === "function") {
+        await msalInstance.initialize();
+      }
 
       const loginRequest = {
         scopes: ["openid", "profile", "offline_access", "Mail.Read"],
       };
 
-      const msalInstance = new msal.PublicClientApplication(msalConfig);
-
-      // ✅ IMPORTANT: initialize (helps with "logged in but not detected" issues)
-      if (typeof msalInstance.initialize === "function") {
-        await msalInstance.initialize();
-      }
-
-      function setUiFromAccount() {
+      function pickAndSetActive() {
         const active = msalInstance.getActiveAccount?.() || null;
         const accounts = msalInstance.getAllAccounts();
+        const acct = active || accounts[0] || null;
 
-        const picked = active || accounts[0] || null;
+        if (acct && msalInstance.setActiveAccount) {
+          msalInstance.setActiveAccount(acct);
+        }
 
-        if (picked) {
-          // ensure MSAL also knows it (active account)
-          if (msalInstance.setActiveAccount) msalInstance.setActiveAccount(picked);
-
-          setStatus(`Logged in: ${picked.username} (accounts: ${accounts.length})`, true);
+        if (acct) {
+          setStatus(`Logged in: ${acct.username} (accounts: ${accounts.length})`, true);
           btnCheck.disabled = false;
         } else {
           setStatus(`Not logged in (accounts: ${accounts.length})`, null);
@@ -208,72 +210,57 @@
         }
       }
 
-      async function initMsal() {
-        hideBanner();
-
-        try {
-          const resp = await msalInstance.handleRedirectPromise();
-          if (resp?.account) {
-            if (msalInstance.setActiveAccount) msalInstance.setActiveAccount(resp.account);
-          }
-        } catch (e) {
-          console.error("handleRedirectPromise error:", e);
-          showBanner("handleRedirectPromise error:\n" + (e?.message || String(e)));
+      // ✅ Complete redirect flow if we just came back from Microsoft
+      try {
+        const resp = await msalInstance.handleRedirectPromise();
+        if (resp?.account && msalInstance.setActiveAccount) {
+          msalInstance.setActiveAccount(resp.account);
         }
-
-        // Also try to hydrate from cache immediately
-        setUiFromAccount();
+      } catch (e) {
+        console.error("handleRedirectPromise error:", e);
+        showBanner("handleRedirectPromise error:\n" + (e?.message || String(e)));
       }
 
-      async function login() {
+      // hydrate UI from cache
+      pickAndSetActive();
+
+      async function loginSameTab() {
         hideBanner();
-        setStatus("Logging in…", null);
+        setStatus("Redirecting to Microsoft login…", null);
 
-        try {
-          const resp = await msalInstance.loginPopup(loginRequest);
-
-          // ✅ IMPORTANT: set active account
-          if (resp?.account && msalInstance.setActiveAccount) {
-            msalInstance.setActiveAccount(resp.account);
-          }
-
-          // reflect UI from cache/active
-          setUiFromAccount();
-        } catch (e) {
-          console.error("loginPopup failed:", e);
-          const msg = e?.message || String(e);
-
-          if (msg.toLowerCase().includes("popup") || msg.toLowerCase().includes("blocked")) {
-            showBanner("Popup blocked. Falling back to redirect login…");
-            await msalInstance.loginRedirect(loginRequest);
-            return;
-          }
-
-          setStatus("Login failed ❌", false);
-          showBanner("Login failed:\n" + msg);
-        }
+        // IMPORTANT: same-tab redirect (no popup)
+        await msalInstance.loginRedirect(loginRequest);
+        // browser will navigate away; no code after this runs
       }
 
-      async function getToken() {
+      async function getTokenSameTab() {
         const active = msalInstance.getActiveAccount?.() || null;
         const accounts = msalInstance.getAllAccounts();
         const acct = active || accounts[0] || null;
 
-        if (!acct) throw new Error("Not logged in.");
+        if (!acct) {
+          // if not logged in, trigger login redirect
+          await msalInstance.loginRedirect(loginRequest);
+          return null; // navigation happens
+        }
+
         if (msalInstance.setActiveAccount) msalInstance.setActiveAccount(acct);
 
         try {
           const resp = await msalInstance.acquireTokenSilent({ ...loginRequest, account: acct });
           return resp.accessToken;
-        } catch {
-          const resp = await msalInstance.acquireTokenPopup({ ...loginRequest, account: acct });
-          return resp.accessToken;
+        } catch (e) {
+          // If silent fails (consent/interaction), do redirect in same tab
+          const msg = e?.message || String(e);
+          showBanner("Need interaction for token. Redirecting…\n" + msg);
+          await msalInstance.acquireTokenRedirect({ ...loginRequest, account: acct });
+          return null; // navigation happens
         }
       }
 
       btnLogin.addEventListener("click", (e) => {
         e.preventDefault();
-        login();
+        loginSameTab();
       });
 
       btnCheck.addEventListener("click", async () => {
@@ -286,7 +273,8 @@
 
         try {
           const date = dateEl.value;
-          const token = await getToken();
+          const token = await getTokenSameTab();
+          if (!token) return; // redirect likely happened
 
           const res = await fetch(`/api/check?date=${encodeURIComponent(date)}&debug=1`, {
             headers: { Authorization: `Bearer ${token}` },
@@ -371,10 +359,6 @@
           btnSend.disabled = false;
         }
       });
-
-      // boot hydrate
-      setStatus("Ready (not logged in)", null);
-      await initMsal();
     }
 
     bootMsal();
