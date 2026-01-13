@@ -247,7 +247,6 @@ async function getExpectedOutlookKeys({ mailbox, date, logs, token, mode }) {
     const messageId = m.id;
 
     const attsUrl = `${usedBase}/messages/${encodeURIComponent(messageId)}/attachments?$top=999`;
-
     logs.push({ t: nowIso(), step: "outlook.attachments.url", index: i, messageId, attsUrl });
 
     const attachments = await fetchAllPagedGraph(token, attsUrl, logs, `outlook.attachments.msg_${i + 1}`);
@@ -279,6 +278,7 @@ async function getExpectedOutlookKeys({ mailbox, date, logs, token, mode }) {
     }
   }
 
+  // Outlook attachmentIds are unique per message anyway, but we still dedupe for safety.
   const seen = new Set();
   const uniq = [];
   for (const e of expected) {
@@ -409,21 +409,7 @@ function datePrefix(ts) {
   return String(ts || "").slice(0, 10);
 }
 
-function isDuplicateFlagCell(v) {
-  const s = String(v ?? "").trim().toLowerCase();
-  if (!s) return false;
-  if (s === "duplicate") return true;
-  if (s === "dup") return true;
-  if (s === "dublikatas") return true;
-  if (s === "dublis") return true;
-  if (s === "1" || s === "true" || s === "yes" || s === "y") return true;
-  if (s.includes("duplicate")) return true;
-  if (s.includes("dublik")) return true;
-  if (s.includes("dubl")) return true;
-  return false;
-}
-
-async function getSheetKeysForDate({ spreadsheetId, recognizedTab, unrecognizedTab, date, logs }) {
+async function getSheetRowsForDate({ spreadsheetId, recognizedTab, unrecognizedTab, date, logs }) {
   logs.push({ t: nowIso(), step: "sheets.start", spreadsheetId, recognizedTab, unrecognizedTab, date });
 
   const accessToken = await getGoogleAccessTokenServiceAccount(logs);
@@ -440,7 +426,7 @@ async function getSheetKeysForDate({ spreadsheetId, recognizedTab, unrecognizedT
   const rec = await readTab(recognizedTab);
   const unr = await readTab(unrecognizedTab);
 
-  function extract(tab, tabLabel) {
+  function extractRows(tab, sourceLabel) {
     const map = indexByHeader(tab.headers);
 
     const idxDate = pickIdx(map, ["data", "date", "timestamp"]);
@@ -454,30 +440,14 @@ async function getSheetKeysForDate({ spreadsheetId, recognizedTab, unrecognizedT
       "pavadinimas",
     ]);
 
-    // IMPORTANT: detect the "duplicate" marker column used by your workflow
-    const idxDup = pickIdx(map, [
-      "duplicate",
-      "duplicates",
-      "duplicate flag",
-      "duplicate_flag",
-      "dup",
-      "dublikatas",
-      "dublis",
-      "status",
-      "flag",
-      "žyma",
-      "zyme",
-    ]);
-
     logs.push({
       t: nowIso(),
       step: "sheets.tab.columns",
-      tab: tabLabel,
+      tab: sourceLabel,
       idxDate,
       idxMsg,
       idxAtt,
       idxName,
-      idxDup,
       headers_preview: tab.headers.slice(0, 12),
     });
 
@@ -485,100 +455,69 @@ async function getSheetKeysForDate({ spreadsheetId, recognizedTab, unrecognizedT
       throw new Error("Sheets must contain columns: Data, MessageId, AttachmentId");
     }
 
-    // We track:
-    // - raw rows for date (including duplicates flagged)
-    // - duplicates flagged by the DUPLICATE column
-    // - non-duplicate rows (raw - flagged)
-    // - keys used for matching (MessageId+AttachmentId unique), INCLUDING duplicates flagged
-    // - keys non-duplicate only (excluding flagged duplicates) - this matches your "total=18" sheet summary
-    let rawRowsForDate = 0;
-    let duplicatesFlaggedRows = 0;
-
-    const keyCountsAll = new Map();      // key -> sample
-    const keyCountsNonDup = new Map();   // key -> sample (only rows NOT flagged duplicate)
-
+    const rowsForDate = [];
     for (const r of tab.rows) {
       const ts = r[idxDate];
       if (datePrefix(ts) !== date) continue;
-
-      rawRowsForDate += 1;
-
-      const dupCell = idxDup >= 0 ? r[idxDup] : "";
-      const isDupFlagged = idxDup >= 0 ? isDuplicateFlagCell(dupCell) : false;
-      if (isDupFlagged) duplicatesFlaggedRows += 1;
 
       const messageId = r[idxMsg] || "";
       const attachmentId = r[idxAtt] || "";
       if (!messageId || !attachmentId) continue;
 
-      const sample = {
+      rowsForDate.push({
         messageId,
         attachmentId,
         name: idxName >= 0 ? String(r[idxName] || "") : "",
-      };
-
-      const key = `${messageId}::${attachmentId}`;
-
-      // all rows (including duplicates flagged)
-      if (!keyCountsAll.has(key)) keyCountsAll.set(key, sample);
-
-      // only non-duplicate-flagged rows
-      if (!isDupFlagged) {
-        if (!keyCountsNonDup.has(key)) keyCountsNonDup.set(key, sample);
-      }
+        source: sourceLabel,
+      });
     }
-
-    const unique_all = Array.from(keyCountsAll.values());
-    const unique_nondup = Array.from(keyCountsNonDup.values());
-
-    const nonDupRowsForDate = rawRowsForDate - duplicatesFlaggedRows;
 
     logs.push({
       t: nowIso(),
       step: "sheets.tab.filtered",
-      tab: tabLabel,
-      raw_rows_for_date: rawRowsForDate,
-      duplicates_flagged_rows: duplicatesFlaggedRows,
-      nondup_rows_for_date: nonDupRowsForDate,
-      unique_all_keys: unique_all.length,
-      unique_nondup_keys: unique_nondup.length,
+      tab: sourceLabel,
+      rows_for_date: rowsForDate.length,
     });
 
-    return {
-      unique_all,
-      unique_nondup,
-      raw_rows_for_date: rawRowsForDate,
-      duplicates_flagged_rows: duplicatesFlaggedRows,
-      nondup_rows_for_date: nonDupRowsForDate,
-      has_dup_column: idxDup >= 0,
-    };
+    return rowsForDate;
   }
 
-  const recognized = extract(rec, "recognized");
-  const unrecognized = extract(unr, "unrecognized");
+  const recognized_rows = extractRows(rec, "recognized");
+  const unrecognized_rows = extractRows(unr, "unrecognized");
+
+  // Total attachments in Sheets (raw rows) = what humans expect
+  const sheets_total_rows = recognized_rows.length + unrecognized_rows.length;
+
+  // Unique keys used for matching (internal)
+  const seen = new Set();
+  const uniqueKeys = [];
+  let duplicateKeyCollisions = 0;
+
+  for (const x of [...recognized_rows, ...unrecognized_rows]) {
+    const k = `${x.messageId}::${x.attachmentId}`;
+    if (seen.has(k)) {
+      duplicateKeyCollisions += 1;
+      continue;
+    }
+    seen.add(k);
+    uniqueKeys.push(x);
+  }
+
+  logs.push({
+    t: nowIso(),
+    step: "sheets.keys.summary",
+    sheets_total_rows,
+    unique_keys_total: uniqueKeys.length,
+    duplicate_key_collisions: duplicateKeyCollisions,
+  });
 
   return {
-    // keys used for matching (includes duplicates flagged)
-    recognized_unique_all: recognized.unique_all,
-    unrecognized_unique_all: unrecognized.unique_all,
-
-    // keys excluding duplicates flagged (matches your "total=18" sheet summary)
-    recognized_unique_nondup: recognized.unique_nondup,
-    unrecognized_unique_nondup: unrecognized.unique_nondup,
-
-    // row counts
-    recognized_total_rows: recognized.raw_rows_for_date,
-    unrecognized_total_rows: unrecognized.raw_rows_for_date,
-    recognized_duplicates_flagged: recognized.duplicates_flagged_rows,
-    unrecognized_duplicates_flagged: unrecognized.duplicates_flagged_rows,
-    recognized_nondup_rows: recognized.nondup_rows_for_date,
-    unrecognized_nondup_rows: unrecognized.nondup_rows_for_date,
-
-    sheets_total_rows: recognized.raw_rows_for_date + unrecognized.raw_rows_for_date,
-    sheets_duplicates_flagged_total: recognized.duplicates_flagged_rows + unrecognized.duplicates_flagged_rows,
-    sheets_nondup_rows_total: recognized.nondup_rows_for_date + unrecognized.nondup_rows_for_date,
-
-    has_dup_column: recognized.has_dup_column || unrecognized.has_dup_column,
+    recognized_rows,
+    unrecognized_rows,
+    sheets_total_rows,
+    uniqueKeys, // for matching
+    unique_keys_total: uniqueKeys.length,
+    duplicate_key_collisions: duplicateKeyCollisions,
   };
 }
 
@@ -621,23 +560,17 @@ export default async function handler(req, res) {
       token = await getGraphTokenAppOnly(logs);
     }
 
-    // OUTLOOK expected keys (unique by messageId+attachmentId)
+    // OUTLOOK (unique keys)
     const outlook = await getExpectedOutlookKeys({ mailbox, date, logs, token, mode });
 
-    // SHEETS
-    const sheets = await getSheetKeysForDate({ spreadsheetId, recognizedTab, unrecognizedTab, date, logs });
-
-    // Use SHEETS UNIQUE ALL KEYS for matching (includes duplicate-flagged rows)
-    const sheetsAll = [
-      ...sheets.recognized_unique_all.map((x) => ({ ...x, source: "recognized" })),
-      ...sheets.unrecognized_unique_all.map((x) => ({ ...x, source: "unrecognized" })),
-    ];
+    // SHEETS (raw rows + unique keys for matching)
+    const sheets = await getSheetRowsForDate({ spreadsheetId, recognizedTab, unrecognizedTab, date, logs });
 
     const expectedSet = new Map();
     for (const e of outlook.expected) expectedSet.set(`${e.messageId}::${e.attachmentId}`, e);
 
     const sheetsSet = new Map();
-    for (const s of sheetsAll) sheetsSet.set(`${s.messageId}::${s.attachmentId}`, s);
+    for (const s of sheets.uniqueKeys) sheetsSet.set(`${s.messageId}::${s.attachmentId}`, s);
 
     const missing = [];
     for (const [k, e] of expectedSet.entries()) if (!sheetsSet.has(k)) missing.push(e);
@@ -647,44 +580,22 @@ export default async function handler(req, res) {
 
     const ready = missing.length === 0 && extra.length === 0;
 
-    // Nice human explanation
-    const warnings = [];
-    if (sheets.has_dup_column && (sheets.sheets_duplicates_flagged_total || 0) > 0) {
-      warnings.push(
-        `Sheets has ${sheets.sheets_duplicates_flagged_total} rows marked as DUPLICATE (recognized ${sheets.recognized_duplicates_flagged}, unrecognized ${sheets.unrecognized_duplicates_flagged}). ` +
-        `These are business duplicates (flag column), not MessageId+AttachmentId collisions. Matching uses keys and still includes them.`
-      );
-    }
-
+    // Payload that you POST to n8n (human totals included)
     const payload = {
       date,
       mailbox,
-
-      // Matching counts (keys)
-      expected_total: outlook.expected.length,
-      sheets_keys_total: sheetsAll.length, // renamed for clarity
-      recognized_keys: sheets.recognized_unique_all.length,
-      unrecognized_keys: sheets.unrecognized_unique_all.length,
-
-      // Sheet “business” totals (exclude DUPLICATE-flagged rows)
-      sheets_total_rows: sheets.sheets_total_rows,
-      sheets_duplicates_flagged_total: sheets.sheets_duplicates_flagged_total,
-      sheets_nondup_rows_total: sheets.sheets_nondup_rows_total,
-      recognized_nondup_rows: sheets.recognized_nondup_rows,
-      unrecognized_nondup_rows: sheets.unrecognized_nondup_rows,
-      recognized_duplicates_flagged: sheets.recognized_duplicates_flagged,
-      unrecognized_duplicates_flagged: sheets.unrecognized_duplicates_flagged,
-
-      // These match your summary tab meaning:
-      recognized_total_nondup_keys: sheets.recognized_unique_nondup.length,
-      unrecognized_total_nondup_keys: sheets.unrecognized_unique_nondup.length,
-
-      // Ready logic
+      outlook_attachments_total: outlook.expected.length,         // total attachments in Outlook (after filtering inline images)
+      sheets_attachments_total: sheets.sheets_total_rows,         // total attachments in Sheets = raw rows across tabs
+      recognized_attachments: sheets.recognized_rows.length,      // raw rows
+      unrecognized_attachments: sheets.unrecognized_rows.length,  // raw rows
       missing_count: missing.length,
       extra_count: extra.length,
       ready,
-      warnings,
       generated_at: new Date().toISOString(),
+
+      // Keep these internal-ish for debugging / future auditing (no UI confusion)
+      matching_keys_sheets_unique_total: sheets.unique_keys_total,
+      matching_keys_duplicate_collisions_in_sheets: sheets.duplicate_key_collisions,
     };
 
     return res.status(200).json({
@@ -696,28 +607,15 @@ export default async function handler(req, res) {
       usedBase: outlook.usedBase,
       messages_count: outlook.messages_count,
 
-      // Matching counts (keys)
-      expected_total: outlook.expected.length,
-      sheets_keys_total: sheetsAll.length,
-      recognized_keys: sheets.recognized_unique_all.length,
-      unrecognized_keys: sheets.unrecognized_unique_all.length,
+      // What you want to show to humans:
+      outlook_attachments_total: outlook.expected.length,
+      sheets_attachments_total: sheets.sheets_total_rows,
+      recognized_attachments: sheets.recognized_rows.length,
+      unrecognized_attachments: sheets.unrecognized_rows.length,
 
-      // Business sheet clarity
-      sheets_total_rows: sheets.sheets_total_rows,
-      sheets_duplicates_flagged_total: sheets.sheets_duplicates_flagged_total,
-      sheets_nondup_rows_total: sheets.sheets_nondup_rows_total,
-      recognized_nondup_rows: sheets.recognized_nondup_rows,
-      unrecognized_nondup_rows: sheets.unrecognized_nondup_rows,
-      recognized_duplicates_flagged: sheets.recognized_duplicates_flagged,
-      unrecognized_duplicates_flagged: sheets.unrecognized_duplicates_flagged,
-
-      recognized_total_nondup_keys: sheets.recognized_unique_nondup.length,
-      unrecognized_total_nondup_keys: sheets.unrecognized_unique_nondup.length,
-
+      // Matching results:
       missing_count: missing.length,
       extra_count: extra.length,
-      warnings,
-
       missing: missing.map((x) => ({
         messageId: x.messageId,
         attachmentId: x.attachmentId,
