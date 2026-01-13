@@ -2,9 +2,11 @@
 // Uses:
 // - Microsoft Graph: prefers DELEGATED token from Authorization header,
 //   falls back to client_credentials if no Authorization header.
-// - Google Sheets API (OAuth refresh_token flow) <-- keep as-is (your env vars unchanged)
+// - Google Sheets API: Service Account JWT (GOOGLE_SA_CLIENT_EMAIL + GOOGLE_SA_PRIVATE_KEY)
 
 // ---------- helpers ----------
+import crypto from "crypto";
+
 const IMAGE_EXT = /\.(png|jpe?g|gif|bmp|tiff?|webp|heic|heif|svg)$/i;
 
 function isPdf(att) {
@@ -95,16 +97,26 @@ async function fetchJsonOrThrow(url, opts, logs, stepName) {
     request_id: meta.headers["request-id"] || null,
     client_request_id: opts?.headers?.["client-request-id"] || null,
     duration_ms: Date.now() - started,
-    // helpful Graph headers
-    "x-ms-ags-diagnostic": meta.headers["x-ms-ags-diagnostic"] ? safeTruncate(meta.headers["x-ms-ags-diagnostic"], 600) : null,
+    "x-ms-ags-diagnostic": meta.headers["x-ms-ags-diagnostic"]
+      ? safeTruncate(meta.headers["x-ms-ags-diagnostic"], 600)
+      : null,
   });
 
   if (!meta.ok) {
     const body = meta.json ?? meta.text;
-    throw new Error(`${meta.status} ${meta.statusText}: ${safeTruncate(typeof body === "string" ? body : JSON.stringify(body))}`);
+    throw new Error(
+      `${meta.status} ${meta.statusText}: ${safeTruncate(
+        typeof body === "string" ? body : JSON.stringify(body)
+      )}`
+    );
   }
 
-  const out = meta.json ?? (() => { throw new Error(`Non-JSON response: ${safeTruncate(meta.text)}`); })();
+  const out =
+    meta.json ??
+    (() => {
+      throw new Error(`Non-JSON response: ${safeTruncate(meta.text)}`);
+    })();
+
   return out;
 }
 
@@ -180,18 +192,12 @@ async function getGraphTokenAppOnly(logs) {
     duration_ms: Date.now() - started,
   });
 
-  if (!meta.ok) {
-    throw new Error(`Token error ${meta.status}: ${safeTruncate(meta.text)}`);
-  }
+  if (!meta.ok) throw new Error(`Token error ${meta.status}: ${safeTruncate(meta.text)}`);
 
   const json = meta.json || JSON.parse(meta.text || "{}");
   const token = json.access_token;
 
-  logs.push({
-    t: nowIso(),
-    step: "graph.token.app_only.claims",
-    claims: decodeJwtClaims(token),
-  });
+  logs.push({ t: nowIso(), step: "graph.token.app_only.claims", claims: decodeJwtClaims(token) });
 
   return token;
 }
@@ -208,8 +214,6 @@ async function getExpectedOutlookKeys({ mailbox, date, logs, token, mode }) {
   const { start, end } = utcStartEndExclusive(date);
   logs.push({ t: nowIso(), step: "outlook.date_window_utc", start, end });
 
-  // Delegated: try /users/{mailbox} first (keeps your current behavior),
-  // if 403 -> fallback to /me (works when you log in as invoices@ikrautas.lt)
   const baseUsers = `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(mailbox)}`;
   const baseMe = `https://graph.microsoft.com/v1.0/me`;
 
@@ -225,12 +229,10 @@ async function getExpectedOutlookKeys({ mailbox, date, logs, token, mode }) {
     messages = await fetchAllPagedGraph(token, messagesUrl, logs, "outlook.messages");
   } catch (e) {
     const msg = String(e?.message || e);
-    // Delegated fallback only
     if (mode === "delegated" && msg.includes("403")) {
       usedBase = baseMe;
       messagesUrl = buildMessagesUrl(usedBase);
       logs.push({ t: nowIso(), step: "outlook.messages.fallback_to_me", reason: safeTruncate(msg), messagesUrl });
-
       messages = await fetchAllPagedGraph(token, messagesUrl, logs, "outlook.messages");
     } else {
       throw e;
@@ -298,22 +300,59 @@ async function getExpectedOutlookKeys({ mailbox, date, logs, token, mode }) {
   return { messages_count: messages.length, expected: uniq, usedBase };
 }
 
-// ---------- Google Sheets via OAuth refresh_token ----------
-async function getGoogleAccessToken(logs) {
-  const clientId = process.env.GOOGLE_CLIENT_ID;
-  const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
-  const refreshToken = process.env.GOOGLE_REFRESH_TOKEN;
+// ---------- Google Sheets via Service Account JWT ----------
 
-  if (!clientId || !clientSecret || !refreshToken) {
-    throw new Error("Missing GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET / GOOGLE_REFRESH_TOKEN");
+function base64UrlEncode(bufOrStr) {
+  const b = Buffer.isBuffer(bufOrStr) ? bufOrStr : Buffer.from(String(bufOrStr));
+  return b
+    .toString("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
+}
+
+function signJwtRS256({ header, payload, privateKeyPem }) {
+  const encodedHeader = base64UrlEncode(JSON.stringify(header));
+  const encodedPayload = base64UrlEncode(JSON.stringify(payload));
+  const data = `${encodedHeader}.${encodedPayload}`;
+
+  const signer = crypto.createSign("RSA-SHA256");
+  signer.update(data);
+  signer.end();
+
+  const signature = signer.sign(privateKeyPem);
+  const encodedSig = base64UrlEncode(signature);
+  return `${data}.${encodedSig}`;
+}
+
+async function getGoogleAccessTokenServiceAccount(logs) {
+  const clientEmail = process.env.GOOGLE_SA_CLIENT_EMAIL;
+  let privateKey = process.env.GOOGLE_SA_PRIVATE_KEY;
+
+  if (!clientEmail || !privateKey) {
+    throw new Error("Missing GOOGLE_SA_CLIENT_EMAIL / GOOGLE_SA_PRIVATE_KEY");
   }
 
+  // Vercel env keys often store newlines as \n
+  privateKey = privateKey.replace(/\\n/g, "\n");
+
+  const now = Math.floor(Date.now() / 1000);
   const tokenUrl = "https://oauth2.googleapis.com/token";
+
+  const header = { alg: "RS256", typ: "JWT" };
+  const payload = {
+    iss: clientEmail,
+    scope: "https://www.googleapis.com/auth/spreadsheets.readonly",
+    aud: tokenUrl,
+    iat: now,
+    exp: now + 3600,
+  };
+
+  const assertion = signJwtRS256({ header, payload, privateKeyPem: privateKey });
+
   const body = new URLSearchParams();
-  body.set("client_id", clientId);
-  body.set("client_secret", clientSecret);
-  body.set("refresh_token", refreshToken);
-  body.set("grant_type", "refresh_token");
+  body.set("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer");
+  body.set("assertion", assertion);
 
   const started = Date.now();
   const meta = await fetchWithMeta(tokenUrl, {
@@ -324,17 +363,18 @@ async function getGoogleAccessToken(logs) {
 
   logs.push({
     t: nowIso(),
-    step: "google.token",
+    step: "google.sa.token",
     status: meta.status,
     ok: meta.ok,
     duration_ms: Date.now() - started,
   });
 
   if (!meta.ok) {
-    throw new Error(`Google token error ${meta.status}: ${safeTruncate(meta.text)}`);
+    throw new Error(`Google SA token error ${meta.status}: ${safeTruncate(meta.text)}`);
   }
 
   const json = meta.json || JSON.parse(meta.text || "{}");
+  if (!json.access_token) throw new Error("Google SA token response missing access_token");
   return json.access_token;
 }
 
@@ -345,7 +385,12 @@ async function sheetsValuesGet(accessToken, spreadsheetId, rangeA1, logs) {
 
   logs.push({ t: nowIso(), step: "sheets.values.url", url });
 
-  return fetchJsonOrThrow(url, { headers: { Authorization: `Bearer ${accessToken}` } }, logs, "sheets.values.get");
+  return fetchJsonOrThrow(
+    url,
+    { headers: { Authorization: `Bearer ${accessToken}` } },
+    logs,
+    "sheets.values.get"
+  );
 }
 
 function indexByHeader(headers) {
@@ -369,7 +414,7 @@ function datePrefix(ts) {
 async function getSheetKeysForDate({ spreadsheetId, recognizedTab, unrecognizedTab, date, logs }) {
   logs.push({ t: nowIso(), step: "sheets.start", spreadsheetId, recognizedTab, unrecognizedTab, date });
 
-  const accessToken = await getGoogleAccessToken(logs);
+  const accessToken = await getGoogleAccessTokenServiceAccount(logs);
 
   async function readTab(tabName) {
     const range = `${tabName}!A:Z`;
@@ -481,7 +526,7 @@ export default async function handler(req, res) {
       mode,
       sheet_id_present: !!process.env.SHEET_ID,
       ms_env_present: !!process.env.MS_TENANT_ID && !!process.env.MS_CLIENT_ID && !!process.env.MS_CLIENT_SECRET,
-      google_env_present: !!process.env.GOOGLE_CLIENT_ID && !!process.env.GOOGLE_CLIENT_SECRET && !!process.env.GOOGLE_REFRESH_TOKEN,
+      google_env_present: !!process.env.GOOGLE_SA_CLIENT_EMAIL && !!process.env.GOOGLE_SA_PRIVATE_KEY,
       auth_header_present: !!bearer,
     });
 
