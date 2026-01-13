@@ -25,8 +25,31 @@
     .banner { display:none; border:1px solid #ffd6d6; background:#fff3f3; color:#7a0010; padding:12px; border-radius:10px; margin-top:12px; white-space:pre-wrap; }
   </style>
 
-  <!-- MSAL (must load BEFORE we use it) -->
-  <script src="https://alcdn.msauth.net/browser/2.38.3/js/msal-browser.min.js"></script>
+  <!-- MSAL primary CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/@azure/msal-browser@2.38.3/lib/msal-browser.min.js"></script>
+
+  <!-- Fallback if jsdelivr blocked -->
+  <script>
+    (function () {
+      function load(src) {
+        return new Promise((resolve, reject) => {
+          const s = document.createElement('script');
+          s.src = src;
+          s.async = true;
+          s.onload = resolve;
+          s.onerror = reject;
+          document.head.appendChild(s);
+        });
+      }
+
+      // If msal didn't load from jsdelivr, try Microsoft CDN, then unpkg
+      if (!window.msal) {
+        load("https://alcdn.msauth.net/browser/2.38.3/js/msal-browser.min.js")
+          .catch(() => load("https://unpkg.com/@azure/msal-browser@2.38.3/lib/msal-browser.min.js"))
+          .catch(() => console.error("MSAL failed to load from all CDNs"));
+      }
+    })();
+  </script>
 </head>
 
 <body>
@@ -127,211 +150,213 @@
         ${list.length > 200 ? `<div class="muted">Showing first 200 of ${list.length}</div>` : ''}`;
     }
 
-    // --- MSAL INIT ---
-    if (!window.msal) {
-      setStatus("MSAL not loaded ❌", false);
-      showBanner(
-        "MSAL library failed to load.\n\n" +
-        "Check:\n" +
-        "1) Adblock/Brave shields blocking alcdn.msauth.net\n" +
-        "2) Corporate firewall\n" +
-        "3) CSP headers blocking scripts\n\n" +
-        "Open DevTools -> Console for details."
-      );
-      btnLogin.disabled = true;
-    } else {
+    // --- MSAL INIT (wait a tick in case fallback is still loading) ---
+    async function bootMsal() {
+      // Give fallback loader a moment if the first CDN was blocked
+      for (let i = 0; i < 30; i++) {
+        if (window.msal) break;
+        await new Promise(r => setTimeout(r, 50));
+      }
+
+      if (!window.msal) {
+        setStatus("MSAL not loaded ❌", false);
+        showBanner(
+          "MSAL library failed to load.\n\n" +
+          "Check:\n" +
+          "1) Adblock/Brave shields blocking CDNs\n" +
+          "2) Corporate firewall\n" +
+          "3) CSP headers blocking scripts\n\n" +
+          "Open DevTools -> Console for details."
+        );
+        btnLogin.disabled = true;
+        return null;
+      }
+
       setStatus("Ready (not logged in)", null);
-    }
 
-    const msalConfig = {
-      auth: {
-        clientId: MS_CLIENT_ID,
-        authority: `https://login.microsoftonline.com/${MS_TENANT_ID}`,
-        // You registered https://...vercel.app/ (with slash) so match it exactly:
-        redirectUri: window.location.origin + "/",
-      },
-      cache: { cacheLocation: "localStorage" },
-    };
+      const msalConfig = {
+        auth: {
+          clientId: MS_CLIENT_ID,
+          authority: `https://login.microsoftonline.com/${MS_TENANT_ID}`,
+          // You registered https://...vercel.app/ (with slash) so match it exactly:
+          redirectUri: window.location.origin + "/",
+        },
+        cache: { cacheLocation: "localStorage" },
+      };
 
-    const loginRequest = {
-      scopes: ["openid", "profile", "offline_access", "Mail.Read"],
-    };
+      const loginRequest = {
+        scopes: ["openid", "profile", "offline_access", "Mail.Read"],
+      };
 
-    const msalInstance = window.msal ? new msal.PublicClientApplication(msalConfig) : null;
+      const msalInstance = new msal.PublicClientApplication(msalConfig);
 
-    async function initMsal() {
-      if (!msalInstance) return;
-
-      try {
-        // If we used redirect flow, this completes it:
-        const resp = await msalInstance.handleRedirectPromise();
-        if (resp?.account) {
-          account = resp.account;
-        }
-      } catch (e) {
-        console.error("handleRedirectPromise error:", e);
-        showBanner("handleRedirectPromise error:\n" + (e?.message || String(e)));
-      }
-
-      const accounts = msalInstance.getAllAccounts();
-      if (!account && accounts.length) account = accounts[0];
-
-      if (account) {
-        setStatus(`Logged in: ${account.username}`, true);
-        btnCheck.disabled = false;
-      } else {
-        setStatus("Not logged in", null);
-        btnCheck.disabled = true;
-      }
-    }
-
-    async function login() {
-      hideBanner();
-      if (!msalInstance) return;
-
-      setStatus("Logging in…", null);
-
-      // Popup first; if blocked, fallback to redirect
-      try {
-        const resp = await msalInstance.loginPopup(loginRequest);
-        account = resp.account;
-        setStatus(`Logged in: ${account.username}`, true);
-        btnCheck.disabled = false;
-      } catch (e) {
-        console.error("loginPopup failed:", e);
-
-        const msg = e?.message || String(e);
-        // common popup issues -> redirect fallback
-        if (msg.toLowerCase().includes("popup") || msg.toLowerCase().includes("blocked")) {
-          showBanner("Popup blocked. Falling back to redirect login…");
-          await msalInstance.loginRedirect(loginRequest);
-          return; // redirect will happen
+      async function initMsal() {
+        try {
+          const resp = await msalInstance.handleRedirectPromise();
+          if (resp?.account) account = resp.account;
+        } catch (e) {
+          console.error("handleRedirectPromise error:", e);
+          showBanner("handleRedirectPromise error:\n" + (e?.message || String(e)));
         }
 
-        setStatus("Login failed ❌", false);
-        showBanner("Login failed:\n" + msg);
-      }
-    }
-
-    async function getToken() {
-      if (!account) {
         const accounts = msalInstance.getAllAccounts();
-        if (accounts.length) account = accounts[0];
-      }
-      if (!account) throw new Error("Not logged in.");
+        if (!account && accounts.length) account = accounts[0];
 
-      try {
-        const resp = await msalInstance.acquireTokenSilent({ ...loginRequest, account });
-        return resp.accessToken;
-      } catch (e) {
-        // popup fallback
-        const resp = await msalInstance.acquireTokenPopup({ ...loginRequest, account });
-        return resp.accessToken;
-      }
-    }
-
-    btnLogin.addEventListener("click", (e) => {
-      e.preventDefault();
-      login();
-    });
-
-    btnCheck.addEventListener("click", async () => {
-      btnSend.disabled = true;
-      setStatus("Checking…", null);
-      hideBanner();
-
-      summaryCard.style.display = 'none';
-      detailsCard.style.display = 'none';
-
-      try {
-        const date = dateEl.value;
-        const token = await getToken();
-
-        const res = await fetch(`/api/check?date=${encodeURIComponent(date)}&debug=1`, {
-          headers: { Authorization: `Bearer ${token}` },
-        });
-
-        const data = await res.json().catch(() => ({}));
-        lastCheck = data;
-
-        summaryCard.style.display = 'block';
-        detailsCard.style.display = 'block';
-
-        if (!res.ok || data.error) {
-          setStatus("ERROR ❌", false);
-          summaryEl.innerHTML = `<div class="bad">${escapeHtml(data.error || "Request failed")}</div>`;
-          payloadEl.textContent = JSON.stringify(data, null, 2);
-          detailsEl.innerHTML = '';
-          return;
+        if (account) {
+          setStatus(`Logged in: ${account.username}`, true);
+          btnCheck.disabled = false;
+        } else {
+          setStatus("Not logged in", null);
+          btnCheck.disabled = true;
         }
-
-        summaryEl.innerHTML = `
-          <div class="row">
-            <div><b>Date:</b> ${data.date}</div>
-            <div><b>Expected (Outlook):</b> ${data.expected_total}</div>
-            <div><b>Sheets unique:</b> ${data.sheets_unique_total}</div>
-            <div><b>Missing:</b> ${data.missing_count}</div>
-            <div><b>Extra:</b> ${data.extra_count}</div>
-          </div>
-          <div class="row" style="margin-top:8px;">
-            <div><b>Recognized unique:</b> ${data.recognized_unique}</div>
-            <div><b>Unrecognized unique:</b> ${data.unrecognized_unique}</div>
-            <div><b>Outlook messages:</b> ${data.messages_count}</div>
-            <div><b>Mode:</b> ${data.mode}</div>
-          </div>
-        `;
-
-        payloadEl.textContent = JSON.stringify(data.payload, null, 2);
-
-        detailsEl.innerHTML = `
-          <div class="row">
-            <div><b>Status:</b> <span class="${data.ready ? 'ok' : 'bad'}">${data.ready ? 'READY ✅' : 'NOT READY ❌'}</span></div>
-            <div class="muted">READY only when Missing=0 and Extra=0</div>
-          </div>
-
-          <h4>Missing (Outlook expected but not found in Sheets):</h4>
-          ${renderKeyTable(data.missing)}
-
-          <h4>Extra (in Sheets but not in Outlook expected set):</h4>
-          ${renderKeyTable(data.extra)}
-
-          <h4>Debug logs</h4>
-          <pre>${escapeHtml(JSON.stringify(data.logs || [], null, 2))}</pre>
-        `;
-
-        setStatus(data.ready ? "READY ✅" : "NOT READY ❌", data.ready);
-        btnSend.disabled = !data.ready;
-
-      } catch (e) {
-        console.error(e);
-        setStatus("ERROR ❌", false);
-        showBanner(e?.message || String(e));
       }
-    });
 
-    btnSend.addEventListener("click", async () => {
-      if (!lastCheck?.ready) return;
+      async function login() {
+        hideBanner();
+        setStatus("Logging in…", null);
 
-      btnSend.disabled = true;
-      setStatus("Sending…", null);
+        try {
+          const resp = await msalInstance.loginPopup(loginRequest);
+          account = resp.account;
+          setStatus(`Logged in: ${account.username}`, true);
+          btnCheck.disabled = false;
+        } catch (e) {
+          console.error("loginPopup failed:", e);
+          const msg = e?.message || String(e);
 
-      const res = await fetch('/api/trigger', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(lastCheck.payload),
+          if (msg.toLowerCase().includes("popup") || msg.toLowerCase().includes("blocked")) {
+            showBanner("Popup blocked. Falling back to redirect login…");
+            await msalInstance.loginRedirect(loginRequest);
+            return;
+          }
+
+          setStatus("Login failed ❌", false);
+          showBanner("Login failed:\n" + msg);
+        }
+      }
+
+      async function getToken() {
+        if (!account) {
+          const accounts = msalInstance.getAllAccounts();
+          if (accounts.length) account = accounts[0];
+        }
+        if (!account) throw new Error("Not logged in.");
+
+        try {
+          const resp = await msalInstance.acquireTokenSilent({ ...loginRequest, account });
+          return resp.accessToken;
+        } catch (e) {
+          const resp = await msalInstance.acquireTokenPopup({ ...loginRequest, account });
+          return resp.accessToken;
+        }
+      }
+
+      btnLogin.addEventListener("click", (e) => {
+        e.preventDefault();
+        login();
       });
 
-      const out = await res.json().catch(() => ({}));
-      if (out.ok) {
-        setStatus("Sent ✅", true);
-      } else {
-        setStatus("Send failed ❌", false);
-        showBanner(out.error || "Send failed");
-        btnSend.disabled = false;
-      }
-    });
+      btnCheck.addEventListener("click", async () => {
+        btnSend.disabled = true;
+        setStatus("Checking…", null);
+        hideBanner();
 
-    initMsal();
+        summaryCard.style.display = 'none';
+        detailsCard.style.display = 'none';
+
+        try {
+          const date = dateEl.value;
+          const token = await getToken();
+
+          const res = await fetch(`/api/check?date=${encodeURIComponent(date)}&debug=1`, {
+            headers: { Authorization: `Bearer ${token}` },
+          });
+
+          const data = await res.json().catch(() => ({}));
+          lastCheck = data;
+
+          summaryCard.style.display = 'block';
+          detailsCard.style.display = 'block';
+
+          if (!res.ok || data.error) {
+            setStatus("ERROR ❌", false);
+            summaryEl.innerHTML = `<div class="bad">${escapeHtml(data.error || "Request failed")}</div>`;
+            payloadEl.textContent = JSON.stringify(data, null, 2);
+            detailsEl.innerHTML = '';
+            return;
+          }
+
+          summaryEl.innerHTML = `
+            <div class="row">
+              <div><b>Date:</b> ${data.date}</div>
+              <div><b>Expected (Outlook):</b> ${data.expected_total}</div>
+              <div><b>Sheets unique:</b> ${data.sheets_unique_total}</div>
+              <div><b>Missing:</b> ${data.missing_count}</div>
+              <div><b>Extra:</b> ${data.extra_count}</div>
+            </div>
+            <div class="row" style="margin-top:8px;">
+              <div><b>Recognized unique:</b> ${data.recognized_unique}</div>
+              <div><b>Unrecognized unique:</b> ${data.unrecognized_unique}</div>
+              <div><b>Outlook messages:</b> ${data.messages_count}</div>
+              <div><b>Mode:</b> ${data.mode}</div>
+            </div>
+          `;
+
+          payloadEl.textContent = JSON.stringify(data.payload, null, 2);
+
+          detailsEl.innerHTML = `
+            <div class="row">
+              <div><b>Status:</b> <span class="${data.ready ? 'ok' : 'bad'}">${data.ready ? 'READY ✅' : 'NOT READY ❌'}</span></div>
+              <div class="muted">READY only when Missing=0 and Extra=0</div>
+            </div>
+
+            <h4>Missing (Outlook expected but not found in Sheets):</h4>
+            ${renderKeyTable(data.missing)}
+
+            <h4>Extra (in Sheets but not in Outlook expected set):</h4>
+            ${renderKeyTable(data.extra)}
+
+            <h4>Debug logs</h4>
+            <pre>${escapeHtml(JSON.stringify(data.logs || [], null, 2))}</pre>
+          `;
+
+          setStatus(data.ready ? "READY ✅" : "NOT READY ❌", data.ready);
+          btnSend.disabled = !data.ready;
+
+        } catch (e) {
+          console.error(e);
+          setStatus("ERROR ❌", false);
+          showBanner(e?.message || String(e));
+        }
+      });
+
+      btnSend.addEventListener("click", async () => {
+        if (!lastCheck?.ready) return;
+
+        btnSend.disabled = true;
+        setStatus("Sending…", null);
+
+        const res = await fetch('/api/trigger', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(lastCheck.payload),
+        });
+
+        const out = await res.json().catch(() => ({}));
+        if (out.ok) {
+          setStatus("Sent ✅", true);
+        } else {
+          setStatus("Send failed ❌", false);
+          showBanner(out.error || "Send failed");
+          btnSend.disabled = false;
+        }
+      });
+
+      await initMsal();
+      return msalInstance;
+    }
+
+    bootMsal();
   </script>
 </body>
 </html>
