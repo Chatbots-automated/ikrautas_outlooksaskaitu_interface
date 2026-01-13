@@ -58,7 +58,9 @@
     Compares Outlook vs Sheets by <b>messageId + attachmentId</b>.
     GREEN only when <b>Missing=0</b> and <b>Extra=0</b>.
     <br/>
-    <span class="muted small">Note: Sheets may contain duplicate rows — we show them clearly, but matching is based on unique keys.</span>
+    <span class="muted small">
+      Sheets “DUPLICATE” means a row flagged by your workflow (business duplicate), not a key collision.
+    </span>
   </p>
 
   <div class="row">
@@ -154,7 +156,6 @@
 
     // --- MSAL BOOT ---
     async function bootMsal() {
-      // Wait briefly for fallback loader if needed
       for (let i = 0; i < 40; i++) {
         if (window.msal) break;
         await new Promise(r => setTimeout(r, 50));
@@ -185,23 +186,16 @@
       };
 
       msalInstance = new msal.PublicClientApplication(config);
+      if (typeof msalInstance.initialize === "function") await msalInstance.initialize();
 
-      if (typeof msalInstance.initialize === "function") {
-        await msalInstance.initialize();
-      }
-
-      const loginRequest = {
-        scopes: ["openid", "profile", "offline_access", "Mail.Read"],
-      };
+      const loginRequest = { scopes: ["openid", "profile", "offline_access", "Mail.Read"] };
 
       function pickAndSetActive() {
         const active = msalInstance.getActiveAccount?.() || null;
         const accounts = msalInstance.getAllAccounts();
         const acct = active || accounts[0] || null;
 
-        if (acct && msalInstance.setActiveAccount) {
-          msalInstance.setActiveAccount(acct);
-        }
+        if (acct && msalInstance.setActiveAccount) msalInstance.setActiveAccount(acct);
 
         if (acct) {
           setStatus(`Logged in: ${acct.username} (accounts: ${accounts.length})`, true);
@@ -212,18 +206,14 @@
         }
       }
 
-      // Complete redirect flow
       try {
         const resp = await msalInstance.handleRedirectPromise();
-        if (resp?.account && msalInstance.setActiveAccount) {
-          msalInstance.setActiveAccount(resp.account);
-        }
+        if (resp?.account && msalInstance.setActiveAccount) msalInstance.setActiveAccount(resp.account);
       } catch (e) {
         console.error("handleRedirectPromise error:", e);
         showBanner("handleRedirectPromise error:\n" + (e?.message || String(e)));
       }
 
-      // Hydrate UI from cache
       pickAndSetActive();
 
       async function loginSameTab() {
@@ -291,28 +281,35 @@
             return;
           }
 
-          const dup = Number(data.sheets_duplicates_total || 0);
+          const dupFlagged = Number(data.sheets_duplicates_flagged_total || 0);
+          const nonDupRows = Number(data.sheets_nondup_rows_total || 0);
 
           summaryEl.innerHTML = `
             <div class="row">
               <div><b>Date:</b> ${data.date}</div>
-              <div><b>Expected (Outlook unique):</b> ${data.expected_total}</div>
-              <div><b>Sheets unique:</b> ${data.sheets_unique_total}</div>
+              <div><b>Expected (Outlook keys):</b> ${data.expected_total}</div>
+              <div><b>Sheets keys (used for matching):</b> ${data.sheets_keys_total}</div>
               <div><b>Missing:</b> ${data.missing_count}</div>
               <div><b>Extra:</b> ${data.extra_count}</div>
             </div>
 
             <div class="row" style="margin-top:8px;">
-              <div><b>Recognized unique:</b> ${data.recognized_unique}</div>
-              <div><b>Unrecognized unique:</b> ${data.unrecognized_unique}</div>
+              <div><b>Recognized keys:</b> ${data.recognized_keys}</div>
+              <div><b>Unrecognized keys:</b> ${data.unrecognized_keys}</div>
               <div><b>Outlook messages:</b> ${data.messages_count}</div>
               <div><b>Mode:</b> ${data.mode}</div>
             </div>
 
-            <div class="row" style="margin-top:8px;">
-              <div><b>Sheets total rows:</b> ${data.sheets_total_rows ?? "-"}</div>
-              <div><b>Duplicates in Sheets:</b> <span class="${dup > 0 ? "warn" : "muted"}">${dup}</span></div>
-              <div class="muted small">Matching uses unique MessageId+AttachmentId, so duplicates don’t change READY.</div>
+            <div class="row" style="margin-top:10px;">
+              <div><b>Sheets total rows (raw):</b> ${data.sheets_total_rows ?? "-"}</div>
+              <div><b>Duplicates flagged in Sheets:</b> <span class="${dupFlagged > 0 ? "warn" : "muted"}">${dupFlagged}</span></div>
+              <div><b>Non-duplicate rows (business total):</b> ${nonDupRows}</div>
+            </div>
+
+            <div class="row muted small" style="margin-top:6px;">
+              <div>Business totals:</div>
+              <div>Recognized: ${data.recognized_nondup_rows ?? "-"} (dup: ${data.recognized_duplicates_flagged ?? "-"})</div>
+              <div>Unrecognized: ${data.unrecognized_nondup_rows ?? "-"} (dup: ${data.unrecognized_duplicates_flagged ?? "-"})</div>
             </div>
           `;
 
@@ -330,18 +327,18 @@
 
             ${warningsHtml}
 
-            <h4>Missing (Outlook expected but not found in Sheets):</h4>
+            <h4>Missing (Outlook expected but not found in Sheets keys):</h4>
             ${renderKeyTable(data.missing)}
 
-            <h4>Extra (in Sheets but not in Outlook expected set):</h4>
+            <h4>Extra (in Sheets keys but not in Outlook expected):</h4>
             ${renderKeyTable(data.extra)}
 
             <h4>Debug logs</h4>
             <pre>${escapeHtml(JSON.stringify(data.logs || [], null, 2))}</pre>
           `;
 
-          if (data.ready && dup > 0) {
-            setStatus(`READY ✅ (but ${dup} duplicates in Sheets)`, "warn");
+          if (data.ready && dupFlagged > 0) {
+            setStatus(`READY ✅ (but ${dupFlagged} DUPLICATE rows in Sheets)`, "warn");
           } else {
             setStatus(data.ready ? "READY ✅" : "NOT READY ❌", data.ready);
           }
