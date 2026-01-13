@@ -25,10 +25,8 @@
     .banner { display:none; border:1px solid #ffd6d6; background:#fff3f3; color:#7a0010; padding:12px; border-radius:10px; margin-top:12px; white-space:pre-wrap; }
   </style>
 
-  <!-- MSAL primary CDN -->
   <script src="https://cdn.jsdelivr.net/npm/@azure/msal-browser@2.38.3/lib/msal-browser.min.js"></script>
 
-  <!-- Fallback if jsdelivr blocked -->
   <script>
     (function () {
       function load(src) {
@@ -54,12 +52,8 @@
 <body>
   <h1>Invoice Batch Verifier</h1>
   <p class="muted">
-    Shows <b>total attachments</b> found in Outlook vs Google Sheets for the selected date.
-    READY only when the matching check finds <b>Missing=0</b> and <b>Extra=0</b>.
-    <br/>
-    <span class="muted small">
-      Matching is done by <b>messageId + attachmentId</b> internally (prevents false alarms).
-    </span>
+    Matching uses <b>MessageId + AttachmentId</b> (internal).<br/>
+    The UI shows <b>total attachments</b> from Outlook and total rows from Sheets (including duplicates).
   </p>
 
   <div class="row">
@@ -153,7 +147,6 @@
         ${list.length > 200 ? `<div class="muted">Showing first 200 of ${list.length}</div>` : ''}`;
     }
 
-    // --- MSAL BOOT ---
     async function bootMsal() {
       for (let i = 0; i < 40; i++) {
         if (window.msal) break;
@@ -185,16 +178,23 @@
       };
 
       msalInstance = new msal.PublicClientApplication(config);
-      if (typeof msalInstance.initialize === "function") await msalInstance.initialize();
 
-      const loginRequest = { scopes: ["openid", "profile", "offline_access", "Mail.Read"] };
+      if (typeof msalInstance.initialize === "function") {
+        await msalInstance.initialize();
+      }
+
+      const loginRequest = {
+        scopes: ["openid", "profile", "offline_access", "Mail.Read"],
+      };
 
       function pickAndSetActive() {
         const active = msalInstance.getActiveAccount?.() || null;
         const accounts = msalInstance.getAllAccounts();
         const acct = active || accounts[0] || null;
 
-        if (acct && msalInstance.setActiveAccount) msalInstance.setActiveAccount(acct);
+        if (acct && msalInstance.setActiveAccount) {
+          msalInstance.setActiveAccount(acct);
+        }
 
         if (acct) {
           setStatus(`Logged in: ${acct.username} (accounts: ${accounts.length})`, true);
@@ -207,7 +207,9 @@
 
       try {
         const resp = await msalInstance.handleRedirectPromise();
-        if (resp?.account && msalInstance.setActiveAccount) msalInstance.setActiveAccount(resp.account);
+        if (resp?.account && msalInstance.setActiveAccount) {
+          msalInstance.setActiveAccount(resp.account);
+        }
       } catch (e) {
         console.error("handleRedirectPromise error:", e);
         showBanner("handleRedirectPromise error:\n" + (e?.message || String(e)));
@@ -288,15 +290,13 @@
               <div><b>Missing:</b> ${data.missing_count}</div>
               <div><b>Extra:</b> ${data.extra_count}</div>
             </div>
-
             <div class="row" style="margin-top:8px;">
               <div><b>Recognized attachments:</b> ${data.recognized_attachments}</div>
               <div><b>Unrecognized attachments:</b> ${data.unrecognized_attachments}</div>
               <div><b>Outlook messages:</b> ${data.messages_count}</div>
               <div><b>Mode:</b> ${data.mode}</div>
             </div>
-
-            <div class="muted small" style="margin-top:8px;">
+            <div class="muted small" style="margin-top:10px;">
               READY is based on matching by <b>messageId + attachmentId</b> (internal), so rows won’t “double-count”.
             </div>
           `;
