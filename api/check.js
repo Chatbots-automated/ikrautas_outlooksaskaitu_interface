@@ -1,7 +1,8 @@
 // Vercel Serverless Function: GET /api/check?date=YYYY-MM-DD&debug=1
-// No external deps. Uses:
-// - Microsoft Graph (client_credentials)
-// - Google Sheets API (OAuth refresh_token flow)  <-- keep as-is for now
+// Uses:
+// - Microsoft Graph: prefers DELEGATED token from Authorization header,
+//   falls back to client_credentials if no Authorization header.
+// - Google Sheets API (OAuth refresh_token flow) <-- keep as-is (your env vars unchanged)
 
 // ---------- helpers ----------
 const IMAGE_EXT = /\.(png|jpe?g|gif|bmp|tiff?|webp|heic|heif|svg)$/i;
@@ -26,7 +27,7 @@ function utcStartEndExclusive(dateYYYYMMDD) {
   return { start: start.toISOString(), end: end.toISOString() };
 }
 
-function safeTruncate(s, max = 800) {
+function safeTruncate(s, max = 1200) {
   const str = String(s ?? "");
   return str.length > max ? str.slice(0, max) + "…(truncated)" : str;
 }
@@ -43,12 +44,13 @@ function decodeJwtClaims(accessToken) {
     const payload = parts[1].replace(/-/g, "+").replace(/_/g, "/");
     const json = Buffer.from(payload, "base64").toString("utf8");
     const claims = JSON.parse(json);
-    // return only relevant fields
     return {
       aud: claims.aud,
       iss: claims.iss,
       tid: claims.tid,
       appid: claims.appid,
+      upn: claims.upn || null,
+      preferred_username: claims.preferred_username || null,
       roles: claims.roles || null,
       scp: claims.scp || null,
       exp: claims.exp || null,
@@ -59,7 +61,6 @@ function decodeJwtClaims(accessToken) {
 }
 
 function randId() {
-  // Vercel/node supports crypto.randomUUID in modern runtimes
   try {
     return crypto.randomUUID();
   } catch {
@@ -78,15 +79,7 @@ async function fetchWithMeta(url, opts = {}) {
   } catch {
     json = null;
   }
-  return {
-    ok: r.ok,
-    status: r.status,
-    statusText: r.statusText,
-    url,
-    headers,
-    text,
-    json,
-  };
+  return { ok: r.ok, status: r.status, statusText: r.statusText, url, headers, text, json };
 }
 
 async function fetchJsonOrThrow(url, opts, logs, stepName) {
@@ -102,23 +95,16 @@ async function fetchJsonOrThrow(url, opts, logs, stepName) {
     request_id: meta.headers["request-id"] || null,
     client_request_id: opts?.headers?.["client-request-id"] || null,
     duration_ms: Date.now() - started,
+    // helpful Graph headers
+    "x-ms-ags-diagnostic": meta.headers["x-ms-ags-diagnostic"] ? safeTruncate(meta.headers["x-ms-ags-diagnostic"], 600) : null,
   });
 
   if (!meta.ok) {
-    // include body snippet for debugging
     const body = meta.json ?? meta.text;
-    throw new Error(
-      `${meta.status} ${meta.statusText}: ${safeTruncate(
-        typeof body === "string" ? body : JSON.stringify(body)
-      )}`
-    );
+    throw new Error(`${meta.status} ${meta.statusText}: ${safeTruncate(typeof body === "string" ? body : JSON.stringify(body))}`);
   }
 
-  // prefer json if parse ok, else throw because graph should be json for our calls
-  const out = meta.json ?? (() => {
-    throw new Error(`Non-JSON response: ${safeTruncate(meta.text)}`);
-  })();
-
+  const out = meta.json ?? (() => { throw new Error(`Non-JSON response: ${safeTruncate(meta.text)}`); })();
   return out;
 }
 
@@ -159,7 +145,9 @@ async function fetchAllPagedGraph(token, firstUrl, logs, stepPrefix) {
 }
 
 // ---------- Microsoft Graph ----------
-async function getGraphToken(logs) {
+
+// App-only token (fallback)
+async function getGraphTokenAppOnly(logs) {
   const tenant = process.env.MS_TENANT_ID;
   const clientId = process.env.MS_CLIENT_ID;
   const clientSecret = process.env.MS_CLIENT_SECRET;
@@ -168,9 +156,7 @@ async function getGraphToken(logs) {
     throw new Error("Missing MS_TENANT_ID / MS_CLIENT_ID / MS_CLIENT_SECRET");
   }
 
-  const tokenUrl = `https://login.microsoftonline.com/${encodeURIComponent(
-    tenant
-  )}/oauth2/v2.0/token`;
+  const tokenUrl = `https://login.microsoftonline.com/${encodeURIComponent(tenant)}/oauth2/v2.0/token`;
 
   const body = new URLSearchParams();
   body.set("grant_type", "client_credentials");
@@ -187,7 +173,7 @@ async function getGraphToken(logs) {
 
   logs.push({
     t: nowIso(),
-    step: "graph.token",
+    step: "graph.token.app_only",
     url: tokenUrl,
     status: meta.status,
     ok: meta.ok,
@@ -201,35 +187,56 @@ async function getGraphToken(logs) {
   const json = meta.json || JSON.parse(meta.text || "{}");
   const token = json.access_token;
 
-  const claims = decodeJwtClaims(token);
   logs.push({
     t: nowIso(),
-    step: "graph.token.claims",
-    claims,
-    note:
-      "For app-only access, you must see roles like Mail.Read (Application) in claims.roles. If roles is null -> permissions not granted.",
+    step: "graph.token.app_only.claims",
+    claims: decodeJwtClaims(token),
   });
 
   return token;
 }
 
-async function getExpectedOutlookKeys({ mailbox, date, logs }) {
-  logs.push({ t: nowIso(), step: "outlook.start", mailbox, date });
+function getBearerFromReq(req) {
+  const auth = req.headers?.authorization || req.headers?.Authorization || "";
+  const m = String(auth).match(/^Bearer\s+(.+)$/i);
+  return m ? m[1].trim() : null;
+}
 
-  const token = await getGraphToken(logs);
+async function getExpectedOutlookKeys({ mailbox, date, logs, token, mode }) {
+  logs.push({ t: nowIso(), step: "outlook.start", mailbox, date, mode });
+
   const { start, end } = utcStartEndExclusive(date);
-
   logs.push({ t: nowIso(), step: "outlook.date_window_utc", start, end });
 
-  const messagesUrl =
-    `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(mailbox)}/messages` +
-    `?$select=id,receivedDateTime,hasAttachments` +
-    `&$filter=hasAttachments eq true and receivedDateTime ge ${start} and receivedDateTime lt ${end}` +
-    `&$top=999`;
+  // Delegated: try /users/{mailbox} first (keeps your current behavior),
+  // if 403 -> fallback to /me (works when you log in as invoices@ikrautas.lt)
+  const baseUsers = `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(mailbox)}`;
+  const baseMe = `https://graph.microsoft.com/v1.0/me`;
 
-  logs.push({ t: nowIso(), step: "outlook.messages.url", messagesUrl });
+  const buildMessagesUrl = (base) =>
+    `${base}/messages?$select=id,receivedDateTime,hasAttachments&$filter=hasAttachments eq true and receivedDateTime ge ${start} and receivedDateTime lt ${end}&$top=999`;
 
-  const messages = await fetchAllPagedGraph(token, messagesUrl, logs, "outlook.messages");
+  let usedBase = baseUsers;
+  let messagesUrl = buildMessagesUrl(usedBase);
+  logs.push({ t: nowIso(), step: "outlook.messages.url", messagesUrl, usedBase });
+
+  let messages;
+  try {
+    messages = await fetchAllPagedGraph(token, messagesUrl, logs, "outlook.messages");
+  } catch (e) {
+    const msg = String(e?.message || e);
+    // Delegated fallback only
+    if (mode === "delegated" && msg.includes("403")) {
+      usedBase = baseMe;
+      messagesUrl = buildMessagesUrl(usedBase);
+      logs.push({ t: nowIso(), step: "outlook.messages.fallback_to_me", reason: safeTruncate(msg), messagesUrl });
+
+      messages = await fetchAllPagedGraph(token, messagesUrl, logs, "outlook.messages");
+    } else {
+      throw e;
+    }
+  }
+
   logs.push({ t: nowIso(), step: "outlook.messages.total", count: messages.length });
 
   const expected = [];
@@ -238,21 +245,12 @@ async function getExpectedOutlookKeys({ mailbox, date, logs }) {
     const m = messages[i];
     const messageId = m.id;
 
-    const attsUrl =
-      `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(mailbox)}/messages/${encodeURIComponent(messageId)}/attachments` +
-      `?$top=999`;
+    const attsUrl = `${usedBase}/messages/${encodeURIComponent(messageId)}/attachments?$top=999`;
 
-    logs.push({
-      t: nowIso(),
-      step: "outlook.attachments.url",
-      index: i,
-      messageId,
-      attsUrl,
-    });
+    logs.push({ t: nowIso(), step: "outlook.attachments.url", index: i, messageId, attsUrl });
 
     const attachments = await fetchAllPagedGraph(token, attsUrl, logs, `outlook.attachments.msg_${i + 1}`);
 
-    // count raw attachments
     logs.push({
       t: nowIso(),
       step: "outlook.attachments.total_for_message",
@@ -280,7 +278,6 @@ async function getExpectedOutlookKeys({ mailbox, date, logs }) {
     }
   }
 
-  // unique
   const seen = new Set();
   const uniq = [];
   for (const e of expected) {
@@ -295,9 +292,10 @@ async function getExpectedOutlookKeys({ mailbox, date, logs }) {
     step: "outlook.expected.unique_total",
     expected_raw: expected.length,
     expected_unique: uniq.length,
+    usedBase,
   });
 
-  return { messages_count: messages.length, expected: uniq };
+  return { messages_count: messages.length, expected: uniq, usedBase };
 }
 
 // ---------- Google Sheets via OAuth refresh_token ----------
@@ -347,12 +345,7 @@ async function sheetsValuesGet(accessToken, spreadsheetId, rangeA1, logs) {
 
   logs.push({ t: nowIso(), step: "sheets.values.url", url });
 
-  return fetchJsonOrThrow(
-    url,
-    { headers: { Authorization: `Bearer ${accessToken}` } },
-    logs,
-    "sheets.values.get"
-  );
+  return fetchJsonOrThrow(url, { headers: { Authorization: `Bearer ${accessToken}` } }, logs, "sheets.values.get");
 }
 
 function indexByHeader(headers) {
@@ -394,8 +387,8 @@ async function getSheetKeysForDate({ spreadsheetId, recognizedTab, unrecognizedT
     const map = indexByHeader(tab.headers);
 
     const idxDate = pickIdx(map, ["data", "date", "timestamp"]);
-    const idxMsg  = pickIdx(map, ["messageid", "message id", "message_id"]);
-    const idxAtt  = pickIdx(map, ["attachmentid", "attachment id", "attachment_id"]);
+    const idxMsg = pickIdx(map, ["messageid", "message id", "message_id"]);
+    const idxAtt = pickIdx(map, ["attachmentid", "attachment id", "attachment_id"]);
     const idxName = pickIdx(map, [
       "originalus failo pavadinimas",
       "original filename",
@@ -435,7 +428,6 @@ async function getSheetKeysForDate({ spreadsheetId, recognizedTab, unrecognizedT
       });
     }
 
-    // unique
     const seen = new Set();
     const uniq = [];
     for (const x of out) {
@@ -479,26 +471,33 @@ export default async function handler(req, res) {
     const unrecognizedTab = process.env.SHEET_UNRECOGNIZED_TAB || "Neatpažintos saskaitos";
     if (!spreadsheetId) throw new Error("Missing SHEET_ID");
 
+    const bearer = getBearerFromReq(req);
+    const mode = bearer ? "delegated" : "app_only";
+
     logs.push({
       t: nowIso(),
       step: "env.summary",
       mailbox,
+      mode,
       sheet_id_present: !!process.env.SHEET_ID,
       ms_env_present: !!process.env.MS_TENANT_ID && !!process.env.MS_CLIENT_ID && !!process.env.MS_CLIENT_SECRET,
       google_env_present: !!process.env.GOOGLE_CLIENT_ID && !!process.env.GOOGLE_CLIENT_SECRET && !!process.env.GOOGLE_REFRESH_TOKEN,
+      auth_header_present: !!bearer,
     });
+
+    let token;
+    if (bearer) {
+      token = bearer;
+      logs.push({ t: nowIso(), step: "graph.token.delegated.claims", claims: decodeJwtClaims(token) });
+    } else {
+      token = await getGraphTokenAppOnly(logs);
+    }
 
     // OUTLOOK
-    const outlook = await getExpectedOutlookKeys({ mailbox, date, logs });
+    const outlook = await getExpectedOutlookKeys({ mailbox, date, logs, token, mode });
 
     // SHEETS
-    const sheets = await getSheetKeysForDate({
-      spreadsheetId,
-      recognizedTab,
-      unrecognizedTab,
-      date,
-      logs,
-    });
+    const sheets = await getSheetKeysForDate({ spreadsheetId, recognizedTab, unrecognizedTab, date, logs });
 
     const expectedSet = new Map();
     for (const e of outlook.expected) expectedSet.set(`${e.messageId}::${e.attachmentId}`, e);
@@ -536,6 +535,9 @@ export default async function handler(req, res) {
       ok: true,
       date,
       ready,
+      mode,
+      mailbox,
+      usedBase: outlook.usedBase,
       messages_count: outlook.messages_count,
       expected_total: outlook.expected.length,
       sheets_unique_total: sheetsAll.length,
