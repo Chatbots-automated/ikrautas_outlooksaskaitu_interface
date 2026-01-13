@@ -183,8 +183,9 @@
         await msalInstance.initialize();
       }
 
+      // ✅ add Mail.Read.Shared so delegated can access shared mailbox
       const loginRequest = {
-        scopes: ["openid", "profile", "offline_access", "Mail.Read"],
+        scopes: ["openid", "profile", "offline_access", "Mail.Read", "Mail.Read.Shared"],
       };
 
       function pickAndSetActive() {
@@ -278,7 +279,7 @@
             setStatus("ERROR ❌", false);
             summaryEl.innerHTML = `<div class="bad">${escapeHtml(data.error || "Request failed")}</div>`;
             payloadEl.textContent = JSON.stringify(data, null, 2);
-            detailsEl.innerHTML = '';
+            detailsEl.innerHTML = `<pre>${escapeHtml(JSON.stringify(data.logs || [], null, 2))}</pre>`;
             return;
           }
 
@@ -293,11 +294,13 @@
             <div class="row" style="margin-top:8px;">
               <div><b>Recognized attachments:</b> ${data.recognized_attachments}</div>
               <div><b>Unrecognized attachments:</b> ${data.unrecognized_attachments}</div>
+              <div><b>Sheets rows missing IDs:</b> ${data.sheets_rows_missing_ids ?? 0}</div>
               <div><b>Outlook messages:</b> ${data.messages_count}</div>
               <div><b>Mode:</b> ${data.mode}</div>
+              <div><b>Graph base:</b> <span class="pill">${escapeHtml(data.usedBase || "")}</span></div>
             </div>
             <div class="muted small" style="margin-top:10px;">
-              READY is based on matching by <b>messageId + attachmentId</b> (internal), so rows won’t “double-count”.
+              READY requires: Missing=0, Extra=0, and Sheets rows missing IDs=0.
             </div>
           `;
 
@@ -306,7 +309,7 @@
           detailsEl.innerHTML = `
             <div class="row">
               <div><b>Status:</b> <span class="${data.ready ? 'ok' : 'bad'}">${data.ready ? 'READY ✅' : 'NOT READY ❌'}</span></div>
-              <div class="muted">READY only when Missing=0 and Extra=0</div>
+              <div class="muted">READY only when everything matches and no missing IDs</div>
             </div>
 
             <h4>Missing (Outlook expected but not found in Sheets):</h4>
@@ -341,18 +344,4 @@
           body: JSON.stringify(lastCheck.payload),
         });
 
-        const out = await res.json().catch(() => ({}));
-        if (out.ok) {
-          setStatus("Sent ✅", true);
-        } else {
-          setStatus("Send failed ❌", false);
-          showBanner(out.error || "Send failed");
-          btnSend.disabled = false;
-        }
-      });
-    }
-
-    bootMsal();
-  </script>
-</body>
-</html>
+        const out = await
