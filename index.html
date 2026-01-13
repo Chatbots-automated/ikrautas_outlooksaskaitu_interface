@@ -42,7 +42,6 @@
         });
       }
 
-      // If msal didn't load from jsdelivr, try Microsoft CDN, then unpkg
       if (!window.msal) {
         load("https://alcdn.msauth.net/browser/2.38.3/js/msal-browser.min.js")
           .catch(() => load("https://unpkg.com/@azure/msal-browser@2.38.3/lib/msal-browser.min.js"))
@@ -110,7 +109,6 @@
     dateEl.value = `${now.getUTCFullYear()}-${String(now.getUTCMonth()+1).padStart(2,'0')}-${String(now.getUTCDate()).padStart(2,'0')}`;
 
     let lastCheck = null;
-    let account = null;
 
     function setStatus(text, ok=null) {
       statusPill.textContent = text;
@@ -152,8 +150,8 @@
 
     // --- MSAL INIT (wait a tick in case fallback is still loading) ---
     async function bootMsal() {
-      // Give fallback loader a moment if the first CDN was blocked
-      for (let i = 0; i < 30; i++) {
+      // wait a bit for fallback loader to finish if needed
+      for (let i = 0; i < 40; i++) {
         if (window.msal) break;
         await new Promise(r => setTimeout(r, 50));
       }
@@ -169,16 +167,13 @@
           "Open DevTools -> Console for details."
         );
         btnLogin.disabled = true;
-        return null;
+        return;
       }
-
-      setStatus("Ready (not logged in)", null);
 
       const msalConfig = {
         auth: {
           clientId: MS_CLIENT_ID,
           authority: `https://login.microsoftonline.com/${MS_TENANT_ID}`,
-          // You registered https://...vercel.app/ (with slash) so match it exactly:
           redirectUri: window.location.origin + "/",
         },
         cache: { cacheLocation: "localStorage" },
@@ -190,25 +185,44 @@
 
       const msalInstance = new msal.PublicClientApplication(msalConfig);
 
+      // ✅ IMPORTANT: initialize (helps with "logged in but not detected" issues)
+      if (typeof msalInstance.initialize === "function") {
+        await msalInstance.initialize();
+      }
+
+      function setUiFromAccount() {
+        const active = msalInstance.getActiveAccount?.() || null;
+        const accounts = msalInstance.getAllAccounts();
+
+        const picked = active || accounts[0] || null;
+
+        if (picked) {
+          // ensure MSAL also knows it (active account)
+          if (msalInstance.setActiveAccount) msalInstance.setActiveAccount(picked);
+
+          setStatus(`Logged in: ${picked.username} (accounts: ${accounts.length})`, true);
+          btnCheck.disabled = false;
+        } else {
+          setStatus(`Not logged in (accounts: ${accounts.length})`, null);
+          btnCheck.disabled = true;
+        }
+      }
+
       async function initMsal() {
+        hideBanner();
+
         try {
           const resp = await msalInstance.handleRedirectPromise();
-          if (resp?.account) account = resp.account;
+          if (resp?.account) {
+            if (msalInstance.setActiveAccount) msalInstance.setActiveAccount(resp.account);
+          }
         } catch (e) {
           console.error("handleRedirectPromise error:", e);
           showBanner("handleRedirectPromise error:\n" + (e?.message || String(e)));
         }
 
-        const accounts = msalInstance.getAllAccounts();
-        if (!account && accounts.length) account = accounts[0];
-
-        if (account) {
-          setStatus(`Logged in: ${account.username}`, true);
-          btnCheck.disabled = false;
-        } else {
-          setStatus("Not logged in", null);
-          btnCheck.disabled = true;
-        }
+        // Also try to hydrate from cache immediately
+        setUiFromAccount();
       }
 
       async function login() {
@@ -217,9 +231,14 @@
 
         try {
           const resp = await msalInstance.loginPopup(loginRequest);
-          account = resp.account;
-          setStatus(`Logged in: ${account.username}`, true);
-          btnCheck.disabled = false;
+
+          // ✅ IMPORTANT: set active account
+          if (resp?.account && msalInstance.setActiveAccount) {
+            msalInstance.setActiveAccount(resp.account);
+          }
+
+          // reflect UI from cache/active
+          setUiFromAccount();
         } catch (e) {
           console.error("loginPopup failed:", e);
           const msg = e?.message || String(e);
@@ -236,17 +255,18 @@
       }
 
       async function getToken() {
-        if (!account) {
-          const accounts = msalInstance.getAllAccounts();
-          if (accounts.length) account = accounts[0];
-        }
-        if (!account) throw new Error("Not logged in.");
+        const active = msalInstance.getActiveAccount?.() || null;
+        const accounts = msalInstance.getAllAccounts();
+        const acct = active || accounts[0] || null;
+
+        if (!acct) throw new Error("Not logged in.");
+        if (msalInstance.setActiveAccount) msalInstance.setActiveAccount(acct);
 
         try {
-          const resp = await msalInstance.acquireTokenSilent({ ...loginRequest, account });
+          const resp = await msalInstance.acquireTokenSilent({ ...loginRequest, account: acct });
           return resp.accessToken;
-        } catch (e) {
-          const resp = await msalInstance.acquireTokenPopup({ ...loginRequest, account });
+        } catch {
+          const resp = await msalInstance.acquireTokenPopup({ ...loginRequest, account: acct });
           return resp.accessToken;
         }
       }
@@ -352,8 +372,9 @@
         }
       });
 
+      // boot hydrate
+      setStatus("Ready (not logged in)", null);
       await initMsal();
-      return msalInstance;
     }
 
     bootMsal();
