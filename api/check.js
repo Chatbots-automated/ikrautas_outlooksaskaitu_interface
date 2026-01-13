@@ -4,9 +4,9 @@
 //   falls back to client_credentials if no Authorization header.
 // - Google Sheets API: Service Account JWT (GOOGLE_SA_CLIENT_EMAIL + GOOGLE_SA_PRIVATE_KEY)
 
-// ---------- helpers ----------
 import crypto from "crypto";
 
+// ---------- helpers ----------
 const IMAGE_EXT = /\.(png|jpe?g|gif|bmp|tiff?|webp|heic|heif|svg)$/i;
 
 function isPdf(att) {
@@ -457,46 +457,73 @@ async function getSheetKeysForDate({ spreadsheetId, recognizedTab, unrecognizedT
       throw new Error("Sheets must contain columns: Data, MessageId, AttachmentId");
     }
 
-    const out = [];
+    // Count total rows for date, and duplicates by key
+    const keyCounts = new Map(); // key -> {count, sample}
+    let totalRowsForDate = 0;
+
     for (const r of tab.rows) {
       const ts = r[idxDate];
       if (datePrefix(ts) !== date) continue;
+
+      totalRowsForDate += 1;
 
       const messageId = r[idxMsg] || "";
       const attachmentId = r[idxAtt] || "";
       if (!messageId || !attachmentId) continue;
 
-      out.push({
-        messageId,
-        attachmentId,
-        name: idxName >= 0 ? String(r[idxName] || "") : "",
-      });
+      const key = `${messageId}::${attachmentId}`;
+      const prev = keyCounts.get(key);
+
+      if (prev) {
+        prev.count += 1;
+      } else {
+        keyCounts.set(key, {
+          count: 1,
+          sample: {
+            messageId,
+            attachmentId,
+            name: idxName >= 0 ? String(r[idxName] || "") : "",
+          },
+        });
+      }
     }
 
-    const seen = new Set();
-    const uniq = [];
-    for (const x of out) {
-      const k = `${x.messageId}::${x.attachmentId}`;
-      if (seen.has(k)) continue;
-      seen.add(k);
-      uniq.push(x);
+    const unique = [];
+    let duplicatesTotal = 0; // sum(count-1)
+
+    for (const { count, sample } of keyCounts.values()) {
+      unique.push(sample);
+      if (count > 1) duplicatesTotal += (count - 1);
     }
 
     logs.push({
       t: nowIso(),
       step: "sheets.tab.filtered",
       tab: tabLabel,
-      filtered_raw: out.length,
-      filtered_unique: uniq.length,
+      total_rows_for_date: totalRowsForDate,
+      unique_count: unique.length,
+      duplicates_total: duplicatesTotal,
     });
 
-    return uniq;
+    return { unique, total_rows_for_date: totalRowsForDate, duplicates_total: duplicatesTotal };
   }
 
-  const recognized_unique = extract(rec, "recognized");
-  const unrecognized_unique = extract(unr, "unrecognized");
+  const recognized = extract(rec, "recognized");
+  const unrecognized = extract(unr, "unrecognized");
 
-  return { recognized_unique, unrecognized_unique };
+  return {
+    recognized_unique: recognized.unique,
+    unrecognized_unique: unrecognized.unique,
+
+    recognized_total_rows: recognized.total_rows_for_date,
+    unrecognized_total_rows: unrecognized.total_rows_for_date,
+
+    recognized_duplicates: recognized.duplicates_total,
+    unrecognized_duplicates: unrecognized.duplicates_total,
+
+    sheets_total_rows: recognized.total_rows_for_date + unrecognized.total_rows_for_date,
+    sheets_duplicates_total: recognized.duplicates_total + unrecognized.duplicates_total,
+  };
 }
 
 // ---------- handler ----------
@@ -538,10 +565,10 @@ export default async function handler(req, res) {
       token = await getGraphTokenAppOnly(logs);
     }
 
-    // OUTLOOK
+    // OUTLOOK (unique expected)
     const outlook = await getExpectedOutlookKeys({ mailbox, date, logs, token, mode });
 
-    // SHEETS
+    // SHEETS (unique + total + duplicates)
     const sheets = await getSheetKeysForDate({ spreadsheetId, recognizedTab, unrecognizedTab, date, logs });
 
     const expectedSet = new Map();
@@ -563,16 +590,44 @@ export default async function handler(req, res) {
 
     const ready = missing.length === 0 && extra.length === 0;
 
+    const duplicates_total = Number(sheets.sheets_duplicates_total || 0);
+
+    const warnings =
+      duplicates_total > 0
+        ? [
+            `Sheets contains ${duplicates_total} duplicate rows for this date (recognized ${Number(
+              sheets.recognized_duplicates || 0
+            )}, unrecognized ${Number(
+              sheets.unrecognized_duplicates || 0
+            )}). Matching is done using unique MessageId+AttachmentId keys, so duplicates do not affect readiness.`,
+          ]
+        : [];
+
     const payload = {
       date,
       mailbox,
+
+      // Unique counts used for matching
       expected_total: outlook.expected.length,
       sheets_unique_total: sheetsAll.length,
       recognized_unique: sheets.recognized_unique.length,
       unrecognized_unique: sheets.unrecognized_unique.length,
+
+      // Human clarity
+      sheets_total_rows: Number(sheets.sheets_total_rows || 0),
+      sheets_duplicates_total: duplicates_total,
+      recognized_total_rows: Number(sheets.recognized_total_rows || 0),
+      unrecognized_total_rows: Number(sheets.unrecognized_total_rows || 0),
+      recognized_duplicates: Number(sheets.recognized_duplicates || 0),
+      unrecognized_duplicates: Number(sheets.unrecognized_duplicates || 0),
+
       missing_count: missing.length,
       extra_count: extra.length,
+
+      // READY is based ONLY on missing/extra
       ready,
+      warnings,
+
       generated_at: new Date().toISOString(),
     };
 
@@ -584,12 +639,24 @@ export default async function handler(req, res) {
       mailbox,
       usedBase: outlook.usedBase,
       messages_count: outlook.messages_count,
+
       expected_total: outlook.expected.length,
       sheets_unique_total: sheetsAll.length,
       recognized_unique: sheets.recognized_unique.length,
       unrecognized_unique: sheets.unrecognized_unique.length,
+
+      // Extra clarity fields
+      sheets_total_rows: payload.sheets_total_rows,
+      sheets_duplicates_total: payload.sheets_duplicates_total,
+      recognized_total_rows: payload.recognized_total_rows,
+      unrecognized_total_rows: payload.unrecognized_total_rows,
+      recognized_duplicates: payload.recognized_duplicates,
+      unrecognized_duplicates: payload.unrecognized_duplicates,
+      warnings: payload.warnings,
+
       missing_count: missing.length,
       extra_count: extra.length,
+
       missing: missing.map((x) => ({
         messageId: x.messageId,
         attachmentId: x.attachmentId,
@@ -599,6 +666,7 @@ export default async function handler(req, res) {
         isInline: x.isInline,
       })),
       extra,
+
       payload,
       ...(debug ? { logs } : {}),
     });
