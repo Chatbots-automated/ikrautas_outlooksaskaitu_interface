@@ -13,6 +13,7 @@
     .card { border:1px solid #ddd; border-radius:12px; padding:16px; margin-top:16px; }
     .ok { color: #0a7b2f; font-weight: 800; }
     .bad { color: #b00020; font-weight: 800; }
+    .warn { color: #b36b00; font-weight: 800; }
     .muted { color: #666; }
     table { width: 100%; border-collapse: collapse; margin-top: 12px; }
     th, td { border-bottom:1px solid #eee; padding:8px; text-align:left; font-size: 13px; }
@@ -56,6 +57,8 @@
   <p class="muted">
     Compares Outlook vs Sheets by <b>messageId + attachmentId</b>.
     GREEN only when <b>Missing=0</b> and <b>Extra=0</b>.
+    <br/>
+    <span class="muted small">Note: Sheets may contain duplicate rows — we show them clearly, but matching is based on unique keys.</span>
   </p>
 
   <div class="row">
@@ -113,7 +116,7 @@
 
     function setStatus(text, ok=null) {
       statusPill.textContent = text;
-      statusPill.className = 'pill ' + (ok === true ? 'ok' : ok === false ? 'bad' : 'muted');
+      statusPill.className = 'pill ' + (ok === true ? 'ok' : ok === false ? 'bad' : ok === "warn" ? "warn" : 'muted');
     }
 
     function showBanner(msg) {
@@ -176,7 +179,6 @@
           clientId: MS_CLIENT_ID,
           authority: `https://login.microsoftonline.com/${MS_TENANT_ID}`,
           redirectUri: window.location.origin + "/",
-          // keep default true, but explicit:
           navigateToLoginRequestUrl: true,
         },
         cache: { cacheLocation: "localStorage" },
@@ -210,7 +212,7 @@
         }
       }
 
-      // ✅ Complete redirect flow if we just came back from Microsoft
+      // Complete redirect flow
       try {
         const resp = await msalInstance.handleRedirectPromise();
         if (resp?.account && msalInstance.setActiveAccount) {
@@ -221,16 +223,13 @@
         showBanner("handleRedirectPromise error:\n" + (e?.message || String(e)));
       }
 
-      // hydrate UI from cache
+      // Hydrate UI from cache
       pickAndSetActive();
 
       async function loginSameTab() {
         hideBanner();
         setStatus("Redirecting to Microsoft login…", null);
-
-        // IMPORTANT: same-tab redirect (no popup)
         await msalInstance.loginRedirect(loginRequest);
-        // browser will navigate away; no code after this runs
       }
 
       async function getTokenSameTab() {
@@ -239,9 +238,8 @@
         const acct = active || accounts[0] || null;
 
         if (!acct) {
-          // if not logged in, trigger login redirect
           await msalInstance.loginRedirect(loginRequest);
-          return null; // navigation happens
+          return null;
         }
 
         if (msalInstance.setActiveAccount) msalInstance.setActiveAccount(acct);
@@ -250,11 +248,10 @@
           const resp = await msalInstance.acquireTokenSilent({ ...loginRequest, account: acct });
           return resp.accessToken;
         } catch (e) {
-          // If silent fails (consent/interaction), do redirect in same tab
           const msg = e?.message || String(e);
           showBanner("Need interaction for token. Redirecting…\n" + msg);
           await msalInstance.acquireTokenRedirect({ ...loginRequest, account: acct });
-          return null; // navigation happens
+          return null;
         }
       }
 
@@ -274,7 +271,7 @@
         try {
           const date = dateEl.value;
           const token = await getTokenSameTab();
-          if (!token) return; // redirect likely happened
+          if (!token) return;
 
           const res = await fetch(`/api/check?date=${encodeURIComponent(date)}&debug=1`, {
             headers: { Authorization: `Bearer ${token}` },
@@ -294,29 +291,44 @@
             return;
           }
 
+          const dup = Number(data.sheets_duplicates_total || 0);
+
           summaryEl.innerHTML = `
             <div class="row">
               <div><b>Date:</b> ${data.date}</div>
-              <div><b>Expected (Outlook):</b> ${data.expected_total}</div>
+              <div><b>Expected (Outlook unique):</b> ${data.expected_total}</div>
               <div><b>Sheets unique:</b> ${data.sheets_unique_total}</div>
               <div><b>Missing:</b> ${data.missing_count}</div>
               <div><b>Extra:</b> ${data.extra_count}</div>
             </div>
+
             <div class="row" style="margin-top:8px;">
               <div><b>Recognized unique:</b> ${data.recognized_unique}</div>
               <div><b>Unrecognized unique:</b> ${data.unrecognized_unique}</div>
               <div><b>Outlook messages:</b> ${data.messages_count}</div>
               <div><b>Mode:</b> ${data.mode}</div>
             </div>
+
+            <div class="row" style="margin-top:8px;">
+              <div><b>Sheets total rows:</b> ${data.sheets_total_rows ?? "-"}</div>
+              <div><b>Duplicates in Sheets:</b> <span class="${dup > 0 ? "warn" : "muted"}">${dup}</span></div>
+              <div class="muted small">Matching uses unique MessageId+AttachmentId, so duplicates don’t change READY.</div>
+            </div>
           `;
 
           payloadEl.textContent = JSON.stringify(data.payload, null, 2);
+
+          const warningsHtml = (data.warnings && data.warnings.length)
+            ? `<h4>Warnings</h4><div class="warn small" style="white-space:pre-wrap;">${escapeHtml(data.warnings.join("\n"))}</div>`
+            : '';
 
           detailsEl.innerHTML = `
             <div class="row">
               <div><b>Status:</b> <span class="${data.ready ? 'ok' : 'bad'}">${data.ready ? 'READY ✅' : 'NOT READY ❌'}</span></div>
               <div class="muted">READY only when Missing=0 and Extra=0</div>
             </div>
+
+            ${warningsHtml}
 
             <h4>Missing (Outlook expected but not found in Sheets):</h4>
             ${renderKeyTable(data.missing)}
@@ -328,7 +340,12 @@
             <pre>${escapeHtml(JSON.stringify(data.logs || [], null, 2))}</pre>
           `;
 
-          setStatus(data.ready ? "READY ✅" : "NOT READY ❌", data.ready);
+          if (data.ready && dup > 0) {
+            setStatus(`READY ✅ (but ${dup} duplicates in Sheets)`, "warn");
+          } else {
+            setStatus(data.ready ? "READY ✅" : "NOT READY ❌", data.ready);
+          }
+
           btnSend.disabled = !data.ready;
 
         } catch (e) {
