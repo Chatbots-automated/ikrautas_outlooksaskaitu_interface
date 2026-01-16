@@ -213,8 +213,7 @@ async function getExpectedOutlookKeys({ mailbox, date, logs, token, mode }) {
   const { start, end } = utcStartEndExclusive(date);
   logs.push({ t: nowIso(), step: "outlook.date_window_utc", start, end });
 
-  // ✅ HARD RULE: ALWAYS query the target mailbox via /users/{mailbox}
-  // No fallback to /me because it produces wrong data.
+  // ✅ ALWAYS query the target mailbox via /users/{mailbox}
   const usedBase = `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(mailbox)}`;
 
   const messagesUrl =
@@ -227,12 +226,11 @@ async function getExpectedOutlookKeys({ mailbox, date, logs, token, mode }) {
   try {
     messages = await fetchAllPagedGraph(token, messagesUrl, logs, "outlook.messages");
   } catch (e) {
-    // ✅ If delegated token can’t read the shared mailbox -> fail loud with clear error
     const status = e?.__httpStatus;
     if (mode === "delegated" && (status === 401 || status === 403)) {
       const msg =
         `Delegated token cannot read mailbox "${mailbox}". ` +
-        `You must login with a user that has access to this shared mailbox (Full Access), ` +
+        `Login with a user that has access to this shared mailbox (Full Access), ` +
         `and consent scopes like Mail.Read.Shared. Raw: ${String(e.message || e)}`;
       const err = new Error(msg);
       err.__httpStatus = status;
@@ -407,6 +405,7 @@ function pickIdx(map, names) {
   return -1;
 }
 
+// Robust: turn many date formats into YYYY-MM-DD (or null)
 function normalizeToYMD(v) {
   if (v === null || v === undefined) return null;
   const s = String(v).trim();
@@ -414,6 +413,7 @@ function normalizeToYMD(v) {
 
   if (/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0, 10);
 
+  // Google serial date
   if (/^\d+(\.\d+)?$/.test(s)) {
     const n = Number(s);
     if (Number.isFinite(n) && n > 1000) {
@@ -423,6 +423,7 @@ function normalizeToYMD(v) {
     }
   }
 
+  // dd.mm.yyyy
   let m = s.match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})/);
   if (m) {
     const dd = String(m[1]).padStart(2, "0");
@@ -431,6 +432,7 @@ function normalizeToYMD(v) {
     return `${yy}-${mm}-${dd}`;
   }
 
+  // dd/mm/yyyy
   m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
   if (m) {
     const dd = String(m[1]).padStart(2, "0");
@@ -439,17 +441,28 @@ function normalizeToYMD(v) {
     return `${yy}-${mm}-${dd}`;
   }
 
+  // last resort
   const t = Date.parse(s);
   if (!Number.isNaN(t)) return new Date(t).toISOString().slice(0, 10);
 
   return null;
 }
 
+/**
+ * ✅ FIXED DATE MATCH LOGIC
+ * - If timestamp parses to a valid date and it's NOT the selected date -> return false (NO fallback scan)
+ * - Only fallback scan if timestamp is blank/unparseable (ymd === null)
+ */
 function rowBelongsToDate({ row, idxDate, date, scanCellsCount = 12 }) {
   const v = idxDate >= 0 ? row[idxDate] : null;
   const ymd = normalizeToYMD(v);
+
   if (ymd === date) return true;
 
+  // If we have a real parsed date but it’s different — DO NOT try to "rescue" it by scanning filenames.
+  if (ymd !== null) return false;
+
+  // Timestamp missing/unparseable: fallback scan
   const lim = Math.min(row.length, scanCellsCount);
   for (let i = 0; i < lim; i++) {
     const cell = String(row[i] ?? "");
@@ -469,7 +482,7 @@ async function getSheetAttachmentsForDate({ spreadsheetId, recognizedTab, unreco
   const accessToken = await getGoogleAccessTokenServiceAccount(logs);
 
   async function readTab(tabName) {
-    // ✅ IMPORTANT: read wide range, because MessageId/AttachmentId might be past Z
+    // read wide
     const range = `${tabName}!A:ZZ`;
     const resp = await sheetsValuesGet(accessToken, spreadsheetId, range, logs);
     const values = resp.values || [];
@@ -516,7 +529,6 @@ async function getSheetAttachmentsForDate({ spreadsheetId, recognizedTab, unreco
       throw new Error("Sheets must contain a date column named Data/Date/Timestamp");
     }
 
-    // We will count total rows by date EVEN if ids are missing
     let totalRowsByDate = 0;
     let rowsMissingIds = 0;
 
@@ -600,10 +612,10 @@ async function getSheetAttachmentsForDate({ spreadsheetId, recognizedTab, unreco
     recognized,
     unrecognized,
     unique,
-    sheets_total_rows_by_date,     // ✅ THIS matches your “total attachments” logic
-    sheets_rows_missing_ids,       // diagnostics
+    sheets_total_rows_by_date,
+    sheets_rows_missing_ids,
     unique_keys_total: unique.length,
-    collisions_total: (recognized.collisions + unrecognized.collisions),
+    collisions_total: recognized.collisions + unrecognized.collisions,
   };
 }
 
@@ -646,7 +658,7 @@ export default async function handler(req, res) {
       token = await getGraphTokenAppOnly(logs);
     }
 
-    // OUTLOOK (always /users/{mailbox})
+    // OUTLOOK
     const outlook = await getExpectedOutlookKeys({ mailbox, date, logs, token, mode });
 
     // SHEETS
@@ -665,19 +677,20 @@ export default async function handler(req, res) {
     const extra = [];
     for (const [k, s] of sheetsSet.entries()) if (!expectedSet.has(k)) extra.push(s);
 
+    // If sheets has rows missing IDs for that date, don't allow READY (because matching is incomplete)
     const ready = missing.length === 0 && extra.length === 0 && sheets.sheets_rows_missing_ids === 0;
 
     const payload = {
       date,
       mailbox,
 
-      // totals shown in UI
       outlook_attachments_total: outlook.expected_unique.length,
+
+      // ✅ This should now match your Stats tab "total attachments" (recognized+unrecognized rows for date)
       sheets_attachments_total: sheets.sheets_total_rows_by_date,
       recognized_attachments: sheets.recognized.totalRowsByDate,
       unrecognized_attachments: sheets.unrecognized.totalRowsByDate,
 
-      // matching
       missing_count: missing.length,
       extra_count: extra.length,
       ready,
