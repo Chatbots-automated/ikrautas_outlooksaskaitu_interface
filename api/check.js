@@ -69,8 +69,59 @@ function randId() {
   }
 }
 
+// ✅ prevents “booting forever” on hung upstream calls
+const FETCH_TIMEOUT_MS = Number(process.env.FETCH_TIMEOUT_MS || 15000);
+
+// ✅ small concurrency to avoid timeouts
+function pLimit(limit) {
+  let active = 0;
+  const queue = [];
+  const next = () => {
+    active--;
+    if (queue.length) queue.shift()();
+  };
+  return (fn) =>
+    new Promise((resolve, reject) => {
+      const run = () => {
+        active++;
+        Promise.resolve()
+          .then(fn)
+          .then((val) => {
+            resolve(val);
+            next();
+          })
+          .catch((err) => {
+            reject(err);
+            next();
+          });
+      };
+      if (active < limit) run();
+      else queue.push(run);
+    });
+}
+
 async function fetchWithMeta(url, opts = {}) {
-  const r = await fetch(url, opts);
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+
+  let r;
+  try {
+    r = await fetch(url, { ...opts, signal: controller.signal });
+  } catch (e) {
+    clearTimeout(id);
+    return {
+      ok: false,
+      status: 0,
+      statusText: e?.name === "AbortError" ? "Fetch timeout" : "Fetch error",
+      url,
+      headers: {},
+      text: e?.message ? String(e.message) : String(e),
+      json: null,
+    };
+  }
+
+  clearTimeout(id);
+
   const text = await r.text();
   const headers = {};
   r.headers.forEach((v, k) => (headers[k.toLowerCase()] = v));
@@ -108,7 +159,7 @@ async function fetchJsonOrThrow(url, opts, logs, stepName) {
         typeof body === "string" ? body : JSON.stringify(body)
       )}`
     );
-    err.__httpStatus = meta.status;
+    err.__httpStatus = meta.status || 500;
     throw err;
   }
 
@@ -121,13 +172,26 @@ async function fetchJsonOrThrow(url, opts, logs, stepName) {
   return out;
 }
 
-async function fetchAllPagedGraph(token, firstUrl, logs, stepPrefix) {
+// ✅ prevents infinite paging loops + caps work
+async function fetchAllPagedGraph(token, firstUrl, logs, stepPrefix, maxPages = 12) {
   const out = [];
   let url = firstUrl;
   let page = 0;
+  const seenLinks = new Set();
 
   while (url) {
+    if (seenLinks.has(url)) {
+      logs.push({ t: nowIso(), step: `${stepPrefix}.paging.loop_detected`, url });
+      break;
+    }
+    seenLinks.add(url);
+
     page += 1;
+    if (page > maxPages) {
+      logs.push({ t: nowIso(), step: `${stepPrefix}.paging.page_cap_hit`, maxPages });
+      break;
+    }
+
     const clientRequestId = randId();
 
     const json = await fetchJsonOrThrow(
@@ -224,7 +288,7 @@ async function getExpectedOutlookKeys({ mailbox, date, logs, token, mode }) {
 
   let messages;
   try {
-    messages = await fetchAllPagedGraph(token, messagesUrl, logs, "outlook.messages");
+    messages = await fetchAllPagedGraph(token, messagesUrl, logs, "outlook.messages", 10);
   } catch (e) {
     const status = e?.__httpStatus;
     if (mode === "delegated" && (status === 401 || status === 403)) {
@@ -243,41 +307,47 @@ async function getExpectedOutlookKeys({ mailbox, date, logs, token, mode }) {
 
   const expected = [];
 
-  for (let i = 0; i < messages.length; i++) {
-    const m = messages[i];
-    const messageId = m.id;
+  // ✅ KEY FIX: attachments fetched with small concurrency to avoid timeout/booting
+  const limit = pLimit(Number(process.env.ATTACHMENTS_CONCURRENCY || 5));
 
-    const attsUrl = `${usedBase}/messages/${encodeURIComponent(messageId)}/attachments?$top=999`;
-    logs.push({ t: nowIso(), step: "outlook.attachments.url", index: i, messageId, attsUrl });
+  await Promise.all(
+    messages.map((m, i) =>
+      limit(async () => {
+        const messageId = m.id;
 
-    const attachments = await fetchAllPagedGraph(token, attsUrl, logs, `outlook.attachments.msg_${i + 1}`);
+        const attsUrl = `${usedBase}/messages/${encodeURIComponent(messageId)}/attachments?$top=999`;
+        logs.push({ t: nowIso(), step: "outlook.attachments.url", index: i, messageId, attsUrl });
 
-    logs.push({
-      t: nowIso(),
-      step: "outlook.attachments.total_for_message",
-      index: i,
-      messageId,
-      attachments_count: attachments.length,
-    });
+        const attachments = await fetchAllPagedGraph(token, attsUrl, logs, `outlook.attachments.msg_${i + 1}`, 6);
 
-    for (const a of attachments) {
-      const otype = a["@odata.type"] || "#microsoft.graph.fileAttachment";
-      if (!String(otype).toLowerCase().endsWith("fileattachment")) continue;
+        logs.push({
+          t: nowIso(),
+          step: "outlook.attachments.total_for_message",
+          index: i,
+          messageId,
+          attachments_count: attachments.length,
+        });
 
-      const pdf = isPdf(a);
-      const inlineish = a.isInline === true || !!a.contentId;
-      if (!pdf && inlineish && isImage(a)) continue;
+        for (const a of attachments) {
+          const otype = a["@odata.type"] || "#microsoft.graph.fileAttachment";
+          if (!String(otype).toLowerCase().endsWith("fileattachment")) continue;
 
-      expected.push({
-        messageId,
-        attachmentId: a.id,
-        name: a.name || "",
-        contentType: a.contentType || "",
-        isPdf: pdf,
-        isInline: a.isInline === true,
-      });
-    }
-  }
+          const pdf = isPdf(a);
+          const inlineish = a.isInline === true || !!a.contentId;
+          if (!pdf && inlineish && isImage(a)) continue;
+
+          expected.push({
+            messageId,
+            attachmentId: a.id,
+            name: a.name || "",
+            contentType: a.contentType || "",
+            isPdf: pdf,
+            isInline: a.isInline === true,
+          });
+        }
+      })
+    )
+  );
 
   // Outlook de-dupe by key
   const seen = new Set();
@@ -378,8 +448,9 @@ async function getGoogleAccessTokenServiceAccount(logs) {
 
 async function sheetsValuesGet(accessToken, spreadsheetId, rangeA1, logs) {
   const url =
-    `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(spreadsheetId)}/values/${encodeURIComponent(rangeA1)}` +
-    `?majorDimension=ROWS`;
+    `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(spreadsheetId)}/values/${encodeURIComponent(
+      rangeA1
+    )}` + `?majorDimension=ROWS`;
 
   logs.push({ t: nowIso(), step: "sheets.values.url", url });
 
@@ -648,6 +719,8 @@ export default async function handler(req, res) {
       ms_env_present: !!process.env.MS_TENANT_ID && !!process.env.MS_CLIENT_ID && !!process.env.MS_CLIENT_SECRET,
       google_env_present: !!process.env.GOOGLE_SA_CLIENT_EMAIL && !!process.env.GOOGLE_SA_PRIVATE_KEY,
       auth_header_present: !!bearer,
+      fetch_timeout_ms: FETCH_TIMEOUT_MS,
+      attachments_concurrency: Number(process.env.ATTACHMENTS_CONCURRENCY || 5),
     });
 
     let token;
