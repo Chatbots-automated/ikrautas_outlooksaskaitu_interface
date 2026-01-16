@@ -91,8 +91,8 @@
     window.addEventListener('error', (e) => { showBanner("JS error:\n" + (e?.error?.stack || e?.message || String(e))); });
     window.addEventListener('unhandledrejection', (e) => { showBanner("Unhandled promise:\n" + (e?.reason?.stack || e?.reason || String(e))); });
 
-    const MS_TENANT_ID = "YOUR_TENANT_ID";
-    const MS_CLIENT_ID = "YOUR_CLIENT_ID";
+    const MS_TENANT_ID = "bfc9924e-c574-4dad-ae2d-a46d1b6f1a1a";
+    const MS_CLIENT_ID = "6cedc510-3762-48d6-8a08-fee6df75cc07";
 
     const dateEl = document.getElementById('date');
     const btnLogin = document.getElementById('btnLogin');
