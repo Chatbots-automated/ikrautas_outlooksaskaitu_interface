@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Ikrautas – Batch Verifier</title>
+  <title>Ikrautas – Invoice Batch Verifier</title>
 
   <style>
     body { font-family: ui-sans-serif, system-ui, Arial; margin: 24px; }
@@ -25,8 +25,10 @@
     .banner { display:none; border:1px solid #ffd6d6; background:#fff3f3; color:#7a0010; padding:12px; border-radius:10px; margin-top:12px; white-space:pre-wrap; }
   </style>
 
+  <!-- MSAL primary CDN -->
   <script src="https://cdn.jsdelivr.net/npm/@azure/msal-browser@2.38.3/lib/msal-browser.min.js"></script>
 
+  <!-- Fallback if jsdelivr blocked -->
   <script>
     (function () {
       function load(src) {
@@ -39,7 +41,6 @@
           document.head.appendChild(s);
         });
       }
-
       if (!window.msal) {
         load("https://alcdn.msauth.net/browser/2.38.3/js/msal-browser.min.js")
           .catch(() => load("https://unpkg.com/@azure/msal-browser@2.38.3/lib/msal-browser.min.js"))
@@ -53,7 +54,7 @@
   <h1>Invoice Batch Verifier</h1>
   <p class="muted">
     Matching uses <b>MessageId + AttachmentId</b> (internal).<br/>
-    The UI shows <b>total attachments</b> from Outlook and total rows from Sheets (including duplicates).
+    The UI shows total attachments from Outlook and total rows from Sheets (including duplicates).
   </p>
 
   <div class="row">
@@ -85,6 +86,19 @@
   </div>
 
   <script>
+    // ===== GLOBAL “DON'T DIE SILENTLY” HANDLERS =====
+    const banner = document.getElementById('banner');
+    function showBanner(msg) {
+      banner.style.display = 'block';
+      banner.textContent = msg;
+    }
+    window.addEventListener('error', (e) => {
+      showBanner("JS error:\n" + (e?.error?.stack || e?.message || String(e)));
+    });
+    window.addEventListener('unhandledrejection', (e) => {
+      showBanner("Unhandled promise:\n" + (e?.reason?.stack || e?.reason || String(e)));
+    });
+
     // --- CONFIG ---
     const MS_TENANT_ID = "bfc9924e-c574-4dad-ae2d-a46d1b6f1a1a";
     const MS_CLIENT_ID = "6cedc510-3762-48d6-8a08-fee6df75cc07";
@@ -95,7 +109,6 @@
     const btnCheck = document.getElementById('btnCheck');
     const btnSend = document.getElementById('btnSend');
     const statusPill = document.getElementById('statusPill');
-    const banner = document.getElementById('banner');
 
     const summaryCard = document.getElementById('summaryCard');
     const detailsCard = document.getElementById('detailsCard');
@@ -103,26 +116,18 @@
     const payloadEl = document.getElementById('payload');
     const detailsEl = document.getElementById('details');
 
-    const now = new Date();
-    dateEl.value = `${now.getUTCFullYear()}-${String(now.getUTCMonth()+1).padStart(2,'0')}-${String(now.getUTCDate()).padStart(2,'0')}`;
-
-    let lastCheck = null;
-    let msalInstance = null;
-
     function setStatus(text, ok=null) {
       statusPill.textContent = text;
       statusPill.className = 'pill ' + (ok === true ? 'ok' : ok === false ? 'bad' : 'muted');
     }
+    function hideBanner(){ banner.style.display='none'; banner.textContent=''; }
 
-    function showBanner(msg) {
-      banner.style.display = 'block';
-      banner.textContent = msg;
-    }
+    setStatus("JS loaded ✅", null); // ✅ if you still see Booting… then scripts are not running at all
 
-    function hideBanner() {
-      banner.style.display = 'none';
-      banner.textContent = '';
-    }
+    const now = new Date();
+    dateEl.value = `${now.getUTCFullYear()}-${String(now.getUTCMonth()+1).padStart(2,'0')}-${String(now.getUTCDate()).padStart(2,'0')}`;
+
+    let lastCheck = null;
 
     function escapeHtml(s) {
       return String(s).replace(/[&<>"']/g, c => ({
@@ -148,7 +153,8 @@
     }
 
     async function bootMsal() {
-      for (let i = 0; i < 40; i++) {
+      // Wait for msal global to exist (CDN + fallback)
+      for (let i = 0; i < 60; i++) {
         if (window.msal) break;
         await new Promise(r => setTimeout(r, 50));
       }
@@ -157,113 +163,98 @@
         setStatus("MSAL not loaded ❌", false);
         showBanner(
           "MSAL library failed to load.\n\n" +
-          "Check:\n" +
-          "1) Adblock/Brave shields blocking CDNs\n" +
-          "2) Corporate firewall\n" +
-          "3) CSP headers blocking scripts\n\n" +
-          "Open DevTools -> Console for details."
+          "Fix:\n" +
+          "1) Disable AdBlock/Brave shields\n" +
+          "2) Try another network (corp firewall blocks CDNs)\n" +
+          "3) Open DevTools -> Console (you'll see the blocked URL)\n"
         );
         btnLogin.disabled = true;
         return;
       }
 
-      const config = {
+      const msalConfig = {
         auth: {
           clientId: MS_CLIENT_ID,
           authority: `https://login.microsoftonline.com/${MS_TENANT_ID}`,
           redirectUri: window.location.origin + "/",
-          navigateToLoginRequestUrl: true,
         },
         cache: { cacheLocation: "localStorage" },
       };
 
-      msalInstance = new msal.PublicClientApplication(config);
+      const loginRequest = {
+        scopes: ["openid", "profile", "offline_access", "Mail.Read", "Mail.Read.Shared"],
+      };
+
+      const msalInstance = new msal.PublicClientApplication(msalConfig);
 
       if (typeof msalInstance.initialize === "function") {
         await msalInstance.initialize();
       }
 
-      // ✅ add Mail.Read.Shared so delegated can access shared mailbox
-      const loginRequest = {
-        scopes: ["openid", "profile", "offline_access", "Mail.Read", "Mail.Read.Shared"],
-      };
-
-      function pickAndSetActive() {
+      function setUiFromAccount() {
         const active = msalInstance.getActiveAccount?.() || null;
         const accounts = msalInstance.getAllAccounts();
-        const acct = active || accounts[0] || null;
+        const picked = active || accounts[0] || null;
 
-        if (acct && msalInstance.setActiveAccount) {
-          msalInstance.setActiveAccount(acct);
-        }
-
-        if (acct) {
-          setStatus(`Logged in: ${acct.username} (accounts: ${accounts.length})`, true);
+        if (picked) {
+          msalInstance.setActiveAccount?.(picked);
+          setStatus(`Logged in: ${picked.username}`, true);
           btnCheck.disabled = false;
         } else {
-          setStatus(`Not logged in (accounts: ${accounts.length})`, null);
+          setStatus("Ready (not logged in)", null);
           btnCheck.disabled = true;
         }
       }
 
       try {
         const resp = await msalInstance.handleRedirectPromise();
-        if (resp?.account && msalInstance.setActiveAccount) {
-          msalInstance.setActiveAccount(resp.account);
-        }
+        if (resp?.account) msalInstance.setActiveAccount?.(resp.account);
       } catch (e) {
-        console.error("handleRedirectPromise error:", e);
         showBanner("handleRedirectPromise error:\n" + (e?.message || String(e)));
       }
 
-      pickAndSetActive();
+      setUiFromAccount();
 
-      async function loginSameTab() {
+      async function login() {
         hideBanner();
-        setStatus("Redirecting to Microsoft login…", null);
-        await msalInstance.loginRedirect(loginRequest);
+        setStatus("Logging in…", null);
+        try {
+          const resp = await msalInstance.loginPopup(loginRequest);
+          if (resp?.account) msalInstance.setActiveAccount?.(resp.account);
+          setUiFromAccount();
+        } catch (e) {
+          const msg = e?.message || String(e);
+          setStatus("Login failed ❌", false);
+          showBanner("Login failed:\n" + msg);
+        }
       }
 
-      async function getTokenSameTab() {
-        const active = msalInstance.getActiveAccount?.() || null;
-        const accounts = msalInstance.getAllAccounts();
-        const acct = active || accounts[0] || null;
-
-        if (!acct) {
-          await msalInstance.loginRedirect(loginRequest);
-          return null;
-        }
-
-        if (msalInstance.setActiveAccount) msalInstance.setActiveAccount(acct);
+      async function getToken() {
+        const acct = msalInstance.getActiveAccount?.() || msalInstance.getAllAccounts()[0];
+        if (!acct) throw new Error("Not logged in.");
+        msalInstance.setActiveAccount?.(acct);
 
         try {
           const resp = await msalInstance.acquireTokenSilent({ ...loginRequest, account: acct });
           return resp.accessToken;
-        } catch (e) {
-          const msg = e?.message || String(e);
-          showBanner("Need interaction for token. Redirecting…\n" + msg);
-          await msalInstance.acquireTokenRedirect({ ...loginRequest, account: acct });
-          return null;
+        } catch {
+          const resp = await msalInstance.acquireTokenPopup({ ...loginRequest, account: acct });
+          return resp.accessToken;
         }
       }
 
-      btnLogin.addEventListener("click", (e) => {
-        e.preventDefault();
-        loginSameTab();
-      });
+      btnLogin.addEventListener("click", (e) => { e.preventDefault(); login(); });
 
       btnCheck.addEventListener("click", async () => {
         btnSend.disabled = true;
-        setStatus("Checking…", null);
         hideBanner();
-
+        setStatus("Checking…", null);
         summaryCard.style.display = 'none';
         detailsCard.style.display = 'none';
 
         try {
           const date = dateEl.value;
-          const token = await getTokenSameTab();
-          if (!token) return;
+          const token = await getToken();
 
           const res = await fetch(`/api/check?date=${encodeURIComponent(date)}&debug=1`, {
             headers: { Authorization: `Bearer ${token}` },
@@ -279,7 +270,7 @@
             setStatus("ERROR ❌", false);
             summaryEl.innerHTML = `<div class="bad">${escapeHtml(data.error || "Request failed")}</div>`;
             payloadEl.textContent = JSON.stringify(data, null, 2);
-            detailsEl.innerHTML = `<pre>${escapeHtml(JSON.stringify(data.logs || [], null, 2))}</pre>`;
+            detailsEl.innerHTML = '';
             return;
           }
 
@@ -291,31 +282,20 @@
               <div><b>Missing:</b> ${data.missing_count}</div>
               <div><b>Extra:</b> ${data.extra_count}</div>
             </div>
-            <div class="row" style="margin-top:8px;">
-              <div><b>Recognized attachments:</b> ${data.recognized_attachments}</div>
-              <div><b>Unrecognized attachments:</b> ${data.unrecognized_attachments}</div>
-              <div><b>Sheets rows missing IDs:</b> ${data.sheets_rows_missing_ids ?? 0}</div>
-              <div><b>Outlook messages:</b> ${data.messages_count}</div>
-              <div><b>Mode:</b> ${data.mode}</div>
-              <div><b>Graph base:</b> <span class="pill">${escapeHtml(data.usedBase || "")}</span></div>
-            </div>
-            <div class="muted small" style="margin-top:10px;">
-              READY requires: Missing=0, Extra=0, and Sheets rows missing IDs=0.
-            </div>
           `;
 
-          payloadEl.textContent = JSON.stringify(data.payload, null, 2);
+          payloadEl.textContent = JSON.stringify(data.payload || {}, null, 2);
 
           detailsEl.innerHTML = `
             <div class="row">
               <div><b>Status:</b> <span class="${data.ready ? 'ok' : 'bad'}">${data.ready ? 'READY ✅' : 'NOT READY ❌'}</span></div>
-              <div class="muted">READY only when everything matches and no missing IDs</div>
+              <div class="muted">READY only when Missing=0 and Extra=0</div>
             </div>
 
-            <h4>Missing (Outlook expected but not found in Sheets):</h4>
+            <h4>Missing:</h4>
             ${renderKeyTable(data.missing)}
 
-            <h4>Extra (in Sheets but not in Outlook expected set):</h4>
+            <h4>Extra:</h4>
             ${renderKeyTable(data.extra)}
 
             <h4>Debug logs</h4>
@@ -326,7 +306,6 @@
           btnSend.disabled = !data.ready;
 
         } catch (e) {
-          console.error(e);
           setStatus("ERROR ❌", false);
           showBanner(e?.message || String(e));
         }
@@ -334,9 +313,8 @@
 
       btnSend.addEventListener("click", async () => {
         if (!lastCheck?.ready) return;
-
-        btnSend.disabled = true;
         setStatus("Sending…", null);
+        btnSend.disabled = true;
 
         const res = await fetch('/api/trigger', {
           method: 'POST',
@@ -344,4 +322,13 @@
           body: JSON.stringify(lastCheck.payload),
         });
 
-        const out = await
+        const out = await res.json().catch(() => ({}));
+        if (out.ok) setStatus("Sent ✅", true);
+        else { setStatus("Send failed ❌", false); showBanner(out.error || "Send failed"); btnSend.disabled = false; }
+      });
+    }
+
+    bootMsal();
+  </script>
+</body>
+</html>
