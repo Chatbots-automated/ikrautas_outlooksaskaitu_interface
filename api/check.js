@@ -1,4 +1,4 @@
-// GET /api/check?date=YYYY-MM-DD&debug=1
+// GET /api/check?date=YYYY-MM-DD&tz=Europe/Vilnius&debug=1
 // - Microsoft Graph: prefers DELEGATED token from Authorization header,
 //   falls back to client_credentials if no Authorization header.
 // - Google Sheets API: Service Account JWT (GOOGLE_SA_CLIENT_EMAIL + GOOGLE_SA_PRIVATE_KEY)
@@ -22,13 +22,6 @@ function isImage(att) {
   const name = String(att.name || "").toLowerCase();
   if (ct.startsWith("image/")) return true;
   return IMAGE_EXT.test(name);
-}
-
-function utcStartEndExclusive(dateYYYYMMDD) {
-  const [y, m, d] = dateYYYYMMDD.split("-").map(Number);
-  const start = new Date(Date.UTC(y, m - 1, d, 0, 0, 0));
-  const end = new Date(Date.UTC(y, m - 1, d + 1, 0, 0, 0));
-  return { start: start.toISOString(), end: end.toISOString() };
 }
 
 function safeTruncate(s, max = 1200) {
@@ -69,6 +62,65 @@ function randId() {
   } catch {
     return "req_" + Math.random().toString(16).slice(2);
   }
+}
+
+/**
+ * Return timezone offset in minutes for the given Date instant in a given IANA timezone.
+ * Positive for timezones ahead of UTC (e.g. Vilnius +02 => +120).
+ */
+function tzOffsetMinutes(timeZone, date) {
+  // format the date in that tz, then interpret those parts as if they were UTC
+  const dtf = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
+
+  const parts = dtf.formatToParts(date);
+  const map = {};
+  for (const p of parts) map[p.type] = p.value;
+
+  const asUtc = Date.UTC(
+    Number(map.year),
+    Number(map.month) - 1,
+    Number(map.day),
+    Number(map.hour),
+    Number(map.minute),
+    Number(map.second)
+  );
+
+  // If "date" is the real UTC instant, and "asUtc" is what the same instant looks like in that TZ interpreted as UTC,
+  // their difference is the TZ offset.
+  return Math.round((asUtc - date.getTime()) / 60000);
+}
+
+/**
+ * Build a [start,end) UTC window for a "calendar day" in a chosen timezone.
+ * - If tz=UTC -> exactly UTC midnight boundaries.
+ * - If tz=Europe/Vilnius -> boundaries match Vilnius midnight, correctly handling DST.
+ */
+function startEndExclusive(dateYYYYMMDD, tz) {
+  const [y, m, d] = dateYYYYMMDD.split("-").map(Number);
+
+  const guessStartUtc = Date.UTC(y, m - 1, d, 0, 0, 0);
+  const guessEndUtc = Date.UTC(y, m - 1, d + 1, 0, 0, 0);
+
+  if (!tz || tz === "UTC") {
+    return { start: new Date(guessStartUtc).toISOString(), end: new Date(guessEndUtc).toISOString() };
+  }
+
+  const offsetStart = tzOffsetMinutes(tz, new Date(guessStartUtc));
+  const offsetEnd = tzOffsetMinutes(tz, new Date(guessEndUtc));
+
+  const startUtc = guessStartUtc - offsetStart * 60000;
+  const endUtc = guessEndUtc - offsetEnd * 60000;
+
+  return { start: new Date(startUtc).toISOString(), end: new Date(endUtc).toISOString() };
 }
 
 async function fetchWithMeta(url, opts = {}) {
@@ -230,20 +282,18 @@ function getBearerFromReq(req) {
 
 /**
  * FAST: fetch messages WITH attachments using $expand=attachments(...)
- * FIX: removed contentId from select because base type microsoft.graph.attachment doesn't have it
  */
-async function getExpectedOutlookKeys({ mailbox, date, logs, token, mode }) {
-  logs.push({ t: nowIso(), step: "outlook.start", mailbox, date, mode });
+async function getExpectedOutlookKeys({ mailbox, date, tz, logs, token, mode }) {
+  logs.push({ t: nowIso(), step: "outlook.start", mailbox, date, tz, mode });
 
-  const { start, end } = utcStartEndExclusive(date);
-  logs.push({ t: nowIso(), step: "outlook.date_window_utc", start, end });
+  const { start, end } = startEndExclusive(date, tz);
+  logs.push({ t: nowIso(), step: "outlook.window_utc", start, end, tz });
 
   const usedBase = `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(mailbox)}`;
 
   const messagesUrl =
     `${usedBase}/messages?` +
     `$select=id,receivedDateTime,hasAttachments&` +
-    // ✅ contentId removed
     `$expand=attachments($select=id,name,contentType,isInline)&` +
     `$filter=hasAttachments eq true and receivedDateTime ge ${start} and receivedDateTime lt ${end}&` +
     `$top=50`;
@@ -269,6 +319,9 @@ async function getExpectedOutlookKeys({ mailbox, date, logs, token, mode }) {
   logs.push({ t: nowIso(), step: "outlook.messages_expand.total", count: messages.length });
 
   const expected = [];
+  let pdfCount = 0;
+  let nonPdfCount = 0;
+
   for (const m of messages) {
     const messageId = m.id;
     const atts = Array.isArray(m.attachments) ? m.attachments : [];
@@ -278,11 +331,12 @@ async function getExpectedOutlookKeys({ mailbox, date, logs, token, mode }) {
       if (!String(otype).toLowerCase().endsWith("fileattachment")) continue;
 
       const pdf = isPdf(a);
-
-      // ✅ contentId is not available in this fast-path; rely on isInline only
       const inlineish = a.isInline === true;
 
       if (!pdf && inlineish && isImage(a)) continue;
+
+      if (pdf) pdfCount += 1;
+      else nonPdfCount += 1;
 
       expected.push({
         messageId,
@@ -309,10 +363,22 @@ async function getExpectedOutlookKeys({ mailbox, date, logs, token, mode }) {
     step: "outlook.expected.unique_total",
     expected_raw: expected.length,
     expected_unique: uniq.length,
+    pdfCount,
+    nonPdfCount,
     usedBase,
   });
 
-  return { messages_count: messages.length, expected_unique: uniq, expected_raw_total: expected.length, usedBase };
+  return {
+    messages_count: messages.length,
+    expected_unique: uniq,
+    expected_raw_total: expected.length,
+    usedBase,
+    window_start_utc: start,
+    window_end_utc: end,
+    tz_used: tz || "UTC",
+    pdf_total: pdfCount,
+    nonpdf_total: nonPdfCount,
+  };
 }
 
 // ---------- Google Sheets via Service Account JWT ----------
@@ -462,15 +528,12 @@ function isMarkedDuplicate(cell) {
 }
 
 async function getSheetAttachmentsForDate({ spreadsheetId, recognizedTab, unrecognizedTab, date, logs }) {
-  logs.push({ t: nowIso(), step: "sheets.start", spreadsheetId, recognizedTab, unrecognizedTab, date });
-
   const accessToken = await getGoogleAccessTokenServiceAccount(logs);
 
   async function readTab(tabName) {
     const range = `${tabName}!A:ZZ`;
     const resp = await sheetsValuesGet(accessToken, spreadsheetId, range, logs);
     const values = resp.values || [];
-    logs.push({ t: nowIso(), step: "sheets.tab.read", tabName, rows: values.length, range });
     if (values.length < 2) return { headers: [], rows: [] };
     return { headers: values[0], rows: values.slice(1) };
   }
@@ -478,9 +541,8 @@ async function getSheetAttachmentsForDate({ spreadsheetId, recognizedTab, unreco
   const rec = await readTab(recognizedTab);
   const unr = await readTab(unrecognizedTab);
 
-  function extract(tab, tabLabel) {
+  function extract(tab) {
     const map = indexByHeader(tab.headers);
-
     const idxDate = pickIdx(map, ["data", "date", "timestamp"]);
     const idxMsg = pickIdx(map, ["messageid", "message id", "message_id"]);
     const idxAtt = pickIdx(map, ["attachmentid", "attachment id", "attachment_id"]);
@@ -493,25 +555,19 @@ async function getSheetAttachmentsForDate({ spreadsheetId, recognizedTab, unreco
     let rowsMissingIds = 0;
 
     const allWithIds = [];
-    const markedDuplicates = [];
+    let markedDuplicatesCount = 0;
 
     for (const r of tab.rows) {
       if (!rowBelongsToDate({ row: r, idxDate, date })) continue;
-
       totalRowsByDate += 1;
 
       const messageId = idxMsg >= 0 ? (r[idxMsg] || "") : "";
       const attachmentId = idxAtt >= 0 ? (r[idxAtt] || "") : "";
       const name = idxName >= 0 ? String(r[idxName] || "") : "";
 
-      const dupMarked = idxDup >= 0 ? isMarkedDuplicate(r[idxDup]) : false;
-      if (dupMarked && messageId && attachmentId) markedDuplicates.push({ messageId, attachmentId, name });
+      if (idxDup >= 0 && isMarkedDuplicate(r[idxDup])) markedDuplicatesCount += 1;
 
-      if (!messageId || !attachmentId) {
-        rowsMissingIds += 1;
-        continue;
-      }
-
+      if (!messageId || !attachmentId) { rowsMissingIds += 1; continue; }
       allWithIds.push({ messageId, attachmentId, name });
     }
 
@@ -524,19 +580,17 @@ async function getSheetAttachmentsForDate({ spreadsheetId, recognizedTab, unreco
       unique.push(x);
     }
 
-    const collisions = allWithIds.length - unique.length;
-
     return {
       totalRowsByDate,
       rowsMissingIds,
       unique,
-      collisions,
-      markedDuplicatesCount: markedDuplicates.length,
+      collisions: allWithIds.length - unique.length,
+      markedDuplicatesCount,
     };
   }
 
-  const recognized = extract(rec, "recognized");
-  const unrecognized = extract(unr, "unrecognized");
+  const recognized = extract(rec);
+  const unrecognized = extract(unr);
 
   const allUniquePool = [...recognized.unique, ...unrecognized.unique];
   const seen = new Set();
@@ -570,6 +624,8 @@ export default async function handler(req, res) {
       return res.status(400).json({ ok: false, error: "Invalid date. Use YYYY-MM-DD" });
     }
 
+    const tz = String(req.query.tz || process.env.DATE_TZ || "UTC").trim();
+
     const mailbox = process.env.MAILBOX || "invoices@ikrautas.lt";
     const spreadsheetId = process.env.SHEET_ID;
     const recognizedTab = process.env.SHEET_RECOGNIZED_TAB || "Atpažintos saskaitos";
@@ -580,14 +636,10 @@ export default async function handler(req, res) {
     const mode = bearer ? "delegated" : "app_only";
 
     let token;
-    if (bearer) {
-      token = bearer;
-      logs.push({ t: nowIso(), step: "graph.token.delegated.claims", claims: decodeJwtClaims(token) });
-    } else {
-      token = await getGraphTokenAppOnly(logs);
-    }
+    if (bearer) token = bearer;
+    else token = await getGraphTokenAppOnly(logs);
 
-    const outlook = await getExpectedOutlookKeys({ mailbox, date, logs, token, mode });
+    const outlook = await getExpectedOutlookKeys({ mailbox, date, tz, logs, token, mode });
     const sheets = await getSheetAttachmentsForDate({ spreadsheetId, recognizedTab, unrecognizedTab, date, logs });
 
     const expectedSet = new Map();
@@ -604,24 +656,32 @@ export default async function handler(req, res) {
 
     const ready = missing.length === 0 && extra.length === 0 && sheets.sheets_rows_missing_ids === 0;
 
-    return res.status(200).json({
-      ok: true,
+    const payload = {
       date,
-      ready,
-      mode,
       mailbox,
-      usedBase: outlook.usedBase,
-      messages_count: outlook.messages_count,
+      time_zone_used: outlook.tz_used,
+      window_start_utc: outlook.window_start_utc,
+      window_end_utc: outlook.window_end_utc,
 
       outlook_attachments_total: outlook.expected_unique.length,
+      outlook_attachments_pdf_total: outlook.pdf_total,
+      outlook_attachments_nonpdf_total: outlook.nonpdf_total,
+
       sheets_attachments_total: sheets.sheets_total_rows_by_date,
       recognized_attachments: sheets.recognized.totalRowsByDate,
       unrecognized_attachments: sheets.unrecognized.totalRowsByDate,
 
-      sheets_rows_missing_ids: sheets.sheets_rows_missing_ids,
-
       missing_count: missing.length,
       extra_count: extra.length,
+      ready,
+      generated_at: new Date().toISOString(),
+    };
+
+    return res.status(200).json({
+      ok: true,
+      ...payload,
+      messages_count: outlook.messages_count,
+      usedBase: outlook.usedBase,
 
       missing: missing.map((x) => ({
         messageId: x.messageId,
@@ -632,8 +692,7 @@ export default async function handler(req, res) {
         isInline: x.isInline,
       })),
       extra,
-
-      ...(debug ? { logs } : {}),
+      ...(debug ? { logs, payload } : { payload }),
     });
   } catch (err) {
     const errorMsg = String(err?.message || err);
