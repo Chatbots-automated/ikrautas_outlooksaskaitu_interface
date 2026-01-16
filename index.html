@@ -182,8 +182,9 @@
       };
 
       const loginRequest = {
-        scopes: ["openid", "profile", "offline_access", "Mail.Read", "Mail.Read.Shared"],
-      };
+  scopes: ["openid", "profile", "offline_access", "Mail.Read"],
+};
+
 
       const msalInstance = new msal.PublicClientApplication(msalConfig);
 
