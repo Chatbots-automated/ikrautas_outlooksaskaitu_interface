@@ -2,10 +2,8 @@
 // - Microsoft Graph: prefers DELEGATED token from Authorization header,
 //   falls back to client_credentials if no Authorization header.
 // - Google Sheets API: Service Account JWT (GOOGLE_SA_CLIENT_EMAIL + GOOGLE_SA_PRIVATE_KEY)
-//
-// IMPORTANT: This route MUST run on Node.js runtime because we use RSA signing for Google SA JWT.
 
-export const runtime = "nodejs"; // ✅ force Node runtime in Next.js app router
+export const runtime = "nodejs";
 
 import crypto from "crypto";
 
@@ -208,21 +206,13 @@ async function getGraphTokenAppOnly(logs) {
   body.set("client_secret", clientSecret);
   body.set("scope", "https://graph.microsoft.com/.default");
 
-  const started = Date.now();
   const meta = await fetchWithMeta(tokenUrl, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body,
   });
 
-  logs.push({
-    t: nowIso(),
-    step: "graph.token.app_only",
-    url: tokenUrl,
-    status: meta.status,
-    ok: meta.ok,
-    duration_ms: Date.now() - started,
-  });
+  logs.push({ t: nowIso(), step: "graph.token.app_only", status: meta.status, ok: meta.ok });
 
   if (!meta.ok) throw new Error(`Token error ${meta.status}: ${safeTruncate(meta.text)}`);
 
@@ -239,9 +229,8 @@ function getBearerFromReq(req) {
 }
 
 /**
- * ✅ MAJOR PERFORMANCE FIX:
- * Instead of N+1 calls (messages + attachments per message),
- * we fetch messages WITH attachments using $expand=attachments(...)
+ * FAST: fetch messages WITH attachments using $expand=attachments(...)
+ * FIX: removed contentId from select because base type microsoft.graph.attachment doesn't have it
  */
 async function getExpectedOutlookKeys({ mailbox, date, logs, token, mode }) {
   logs.push({ t: nowIso(), step: "outlook.start", mailbox, date, mode });
@@ -251,11 +240,11 @@ async function getExpectedOutlookKeys({ mailbox, date, logs, token, mode }) {
 
   const usedBase = `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(mailbox)}`;
 
-  // NOTE: Graph can restrict $top when using $expand; keep it safe (50)
   const messagesUrl =
     `${usedBase}/messages?` +
     `$select=id,receivedDateTime,hasAttachments&` +
-    `$expand=attachments($select=id,name,contentType,isInline,contentId)&` +
+    // ✅ contentId removed
+    `$expand=attachments($select=id,name,contentType,isInline)&` +
     `$filter=hasAttachments eq true and receivedDateTime ge ${start} and receivedDateTime lt ${end}&` +
     `$top=50`;
 
@@ -269,8 +258,7 @@ async function getExpectedOutlookKeys({ mailbox, date, logs, token, mode }) {
     if (mode === "delegated" && (status === 401 || status === 403)) {
       const msg =
         `Delegated token cannot read mailbox "${mailbox}". ` +
-        `Login with a user that has access to this shared mailbox (Full Access), ` +
-        `and consent scopes like Mail.Read.Shared. Raw: ${String(e.message || e)}`;
+        `Login with a user that has access to this shared mailbox (Full Access). Raw: ${String(e.message || e)}`;
       const err = new Error(msg);
       err.__httpStatus = status;
       throw err;
@@ -290,7 +278,10 @@ async function getExpectedOutlookKeys({ mailbox, date, logs, token, mode }) {
       if (!String(otype).toLowerCase().endsWith("fileattachment")) continue;
 
       const pdf = isPdf(a);
-      const inlineish = a.isInline === true || !!a.contentId;
+
+      // ✅ contentId is not available in this fast-path; rely on isInline only
+      const inlineish = a.isInline === true;
+
       if (!pdf && inlineish && isImage(a)) continue;
 
       expected.push({
@@ -304,7 +295,6 @@ async function getExpectedOutlookKeys({ mailbox, date, logs, token, mode }) {
     }
   }
 
-  // Outlook de-dupe by key
   const seen = new Set();
   const uniq = [];
   for (const e of expected) {
@@ -477,7 +467,6 @@ async function getSheetAttachmentsForDate({ spreadsheetId, recognizedTab, unreco
   const accessToken = await getGoogleAccessTokenServiceAccount(logs);
 
   async function readTab(tabName) {
-    // keep it wide, but this is ONE call per tab only
     const range = `${tabName}!A:ZZ`;
     const resp = await sheetsValuesGet(accessToken, spreadsheetId, range, logs);
     const values = resp.values || [];
@@ -496,27 +485,7 @@ async function getSheetAttachmentsForDate({ spreadsheetId, recognizedTab, unreco
     const idxMsg = pickIdx(map, ["messageid", "message id", "message_id"]);
     const idxAtt = pickIdx(map, ["attachmentid", "attachment id", "attachment_id"]);
     const idxDup = pickIdx(map, ["duplicate", "duplicates", "dup", "status"]);
-
-    const idxName = pickIdx(map, [
-      "originalus failo pavadinimas",
-      "original filename",
-      "filename",
-      "file name",
-      "pavadinimas",
-      "failas",
-    ]);
-
-    logs.push({
-      t: nowIso(),
-      step: "sheets.tab.columns",
-      tab: tabLabel,
-      idxDate,
-      idxMsg,
-      idxAtt,
-      idxDup,
-      idxName,
-      headers_count: tab.headers.length,
-    });
+    const idxName = pickIdx(map, ["originalus failo pavadinimas","original filename","filename","file name","pavadinimas","failas"]);
 
     if (idxDate < 0) throw new Error("Sheets must contain a date column named Data/Date/Timestamp");
 
@@ -557,22 +526,9 @@ async function getSheetAttachmentsForDate({ spreadsheetId, recognizedTab, unreco
 
     const collisions = allWithIds.length - unique.length;
 
-    logs.push({
-      t: nowIso(),
-      step: "sheets.tab.filtered",
-      tab: tabLabel,
-      total_rows_by_date: totalRowsByDate,
-      rows_missing_ids: rowsMissingIds,
-      rows_with_ids: allWithIds.length,
-      unique_keys: unique.length,
-      duplicate_key_collisions: collisions,
-      duplicate_marked_rows: markedDuplicates.length,
-    });
-
     return {
       totalRowsByDate,
       rowsMissingIds,
-      allWithIds,
       unique,
       collisions,
       markedDuplicatesCount: markedDuplicates.length,
@@ -623,18 +579,6 @@ export default async function handler(req, res) {
     const bearer = getBearerFromReq(req);
     const mode = bearer ? "delegated" : "app_only";
 
-    logs.push({
-      t: nowIso(),
-      step: "env.summary",
-      mailbox,
-      mode,
-      auth_header_present: !!bearer,
-      fetch_timeout_ms: FETCH_TIMEOUT_MS,
-      sheet_id_present: !!process.env.SHEET_ID,
-      google_env_present: !!process.env.GOOGLE_SA_CLIENT_EMAIL && !!process.env.GOOGLE_SA_PRIVATE_KEY,
-      ms_env_present: !!process.env.MS_TENANT_ID && !!process.env.MS_CLIENT_ID && !!process.env.MS_CLIENT_SECRET,
-    });
-
     let token;
     if (bearer) {
       token = bearer;
@@ -643,13 +587,9 @@ export default async function handler(req, res) {
       token = await getGraphTokenAppOnly(logs);
     }
 
-    // OUTLOOK (FAST: $expand=attachments)
     const outlook = await getExpectedOutlookKeys({ mailbox, date, logs, token, mode });
-
-    // SHEETS
     const sheets = await getSheetAttachmentsForDate({ spreadsheetId, recognizedTab, unrecognizedTab, date, logs });
 
-    // Matching on UNIQUE keys only
     const expectedSet = new Map();
     for (const e of outlook.expected_unique) expectedSet.set(`${e.messageId}::${e.attachmentId}`, e);
 
