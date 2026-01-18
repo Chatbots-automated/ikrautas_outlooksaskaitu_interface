@@ -243,7 +243,6 @@ async function getExpectedOutlookKeys({ mailbox, date, logs, token, mode }) {
   const messagesUrl =
     `${usedBase}/messages?` +
     `$select=id,receivedDateTime,hasAttachments&` +
-    // ✅ contentId removed
     `$expand=attachments($select=id,name,contentType,isInline)&` +
     `$filter=hasAttachments eq true and receivedDateTime ge ${start} and receivedDateTime lt ${end}&` +
     `$top=50`;
@@ -278,8 +277,6 @@ async function getExpectedOutlookKeys({ mailbox, date, logs, token, mode }) {
       if (!String(otype).toLowerCase().endsWith("fileattachment")) continue;
 
       const pdf = isPdf(a);
-
-      // ✅ contentId is not available in this fast-path; rely on isInline only
       const inlineish = a.isInline === true;
 
       if (!pdf && inlineish && isImage(a)) continue;
@@ -478,14 +475,21 @@ async function getSheetAttachmentsForDate({ spreadsheetId, recognizedTab, unreco
   const rec = await readTab(recognizedTab);
   const unr = await readTab(unrecognizedTab);
 
-  function extract(tab, tabLabel) {
+  function extract(tab) {
     const map = indexByHeader(tab.headers);
 
     const idxDate = pickIdx(map, ["data", "date", "timestamp"]);
     const idxMsg = pickIdx(map, ["messageid", "message id", "message_id"]);
     const idxAtt = pickIdx(map, ["attachmentid", "attachment id", "attachment_id"]);
     const idxDup = pickIdx(map, ["duplicate", "duplicates", "dup", "status"]);
-    const idxName = pickIdx(map, ["originalus failo pavadinimas","original filename","filename","file name","pavadinimas","failas"]);
+    const idxName = pickIdx(map, [
+      "originalus failo pavadinimas",
+      "original filename",
+      "filename",
+      "file name",
+      "pavadinimas",
+      "failas",
+    ]);
 
     if (idxDate < 0) throw new Error("Sheets must contain a date column named Data/Date/Timestamp");
 
@@ -535,8 +539,8 @@ async function getSheetAttachmentsForDate({ spreadsheetId, recognizedTab, unreco
     };
   }
 
-  const recognized = extract(rec, "recognized");
-  const unrecognized = extract(unr, "unrecognized");
+  const recognized = extract(rec);
+  const unrecognized = extract(unr);
 
   const allUniquePool = [...recognized.unique, ...unrecognized.unique];
   const seen = new Set();
@@ -565,6 +569,55 @@ export default async function handler(req, res) {
   const logs = [];
 
   try {
+    // ✅ Browser config (non-secret)
+    if (req.method === "GET" && String(req.query.config || "") === "1") {
+      return res.status(200).json({
+        ok: true,
+        MS_TENANT_ID: process.env.MS_TENANT_ID || null,
+        MS_CLIENT_ID: process.env.MS_CLIENT_ID || null,
+      });
+    }
+
+    // ✅ Trigger to n8n (same file, no new routes)
+    if (req.method === "POST" && String(req.query.trigger || "") === "1") {
+      const webhookUrl =
+        process.env.N8N_WEBHOOK_URL ||
+        "https://n8n-up8s.onrender.com/webhook/acf87dd7-5013-447e-9f05-d8087ace49c1";
+
+      const body = req.body || {};
+
+      if (!body || typeof body !== "object") {
+        return res.status(400).json({ ok: false, error: "Missing JSON body" });
+      }
+      if (!Array.isArray(body.attachments) || body.attachments.length === 0) {
+        return res.status(400).json({ ok: false, error: "payload.attachments must be a non-empty array" });
+      }
+
+      const meta = await fetchWithMeta(webhookUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+
+      logs.push({ t: nowIso(), step: "n8n.forward", url: webhookUrl, status: meta.status, ok: meta.ok });
+
+      if (!meta.ok) {
+        return res.status(502).json({
+          ok: false,
+          error: `n8n webhook failed ${meta.status}: ${safeTruncate(meta.text)}`,
+          ...(debug ? { logs } : {}),
+        });
+      }
+
+      return res.status(200).json({
+        ok: true,
+        status: meta.status,
+        response: meta.json ?? meta.text,
+        ...(debug ? { logs } : {}),
+      });
+    }
+
+    // ✅ Normal verifier
     const date = String(req.query.date || "").trim();
     if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
       return res.status(400).json({ ok: false, error: "Invalid date. Use YYYY-MM-DD" });
@@ -604,6 +657,29 @@ export default async function handler(req, res) {
 
     const ready = missing.length === 0 && extra.length === 0 && sheets.sheets_rows_missing_ids === 0;
 
+    // ✅ Payload for n8n: messageId + attachmentId (PDF invoices only)
+    const attachments = [];
+    for (const [k, s] of sheetsSet.entries()) {
+      const e = expectedSet.get(k);
+      if (!e) continue;
+      if (!e.isPdf) continue; // invoices only
+      attachments.push({
+        messageId: e.messageId,
+        attachmentId: e.attachmentId,
+        outlookName: e.name || "",
+        contentType: e.contentType || "",
+        sheetName: s.name || "",
+      });
+    }
+
+    const payload = {
+      date,
+      mailbox,
+      mode,
+      usedBase: outlook.usedBase,
+      attachments,
+    };
+
     return res.status(200).json({
       ok: true,
       date,
@@ -632,6 +708,8 @@ export default async function handler(req, res) {
         isInline: x.isInline,
       })),
       extra,
+
+      payload,
 
       ...(debug ? { logs } : {}),
     });
