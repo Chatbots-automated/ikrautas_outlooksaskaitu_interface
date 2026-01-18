@@ -91,7 +91,7 @@
     window.addEventListener('error', (e) => { showBanner("JS error:\n" + (e?.error?.stack || e?.message || String(e))); });
     window.addEventListener('unhandledrejection', (e) => { showBanner("Unhandled promise:\n" + (e?.reason?.stack || e?.reason || String(e))); });
 
-    // ✅ pulled from /api/check?config=1
+    // pulled from /api/check?config=1
     let MS_TENANT_ID = null;
     let MS_CLIENT_ID = null;
 
@@ -157,7 +157,7 @@
         return;
       }
 
-      // ✅ fetch tenant/client from server env
+      // fetch tenant/client from server env
       setStatus("Loading config…", null);
       try {
         const cfgRes = await fetch('/api/check?config=1', { cache: "no-store" });
@@ -187,15 +187,26 @@
           clientId: MS_CLIENT_ID,
           authority: `https://login.microsoftonline.com/${MS_TENANT_ID}`,
           redirectUri: window.location.origin + "/",
+          // ✅ helps keep navigation in the same tab for redirect flows
+          navigateToLoginRequestUrl: false,
         },
         cache: { cacheLocation: "localStorage" },
       };
 
-      // ✅ include shared mailbox scope
+      // keep minimal scopes
       const loginRequest = { scopes: ["openid", "profile", "offline_access", "Mail.Read"] };
 
       const msalInstance = new msal.PublicClientApplication(msalConfig);
       if (typeof msalInstance.initialize === "function") await msalInstance.initialize();
+
+      // ✅ Handle redirect response FIRST (same-tab flow returns here)
+      try {
+        setStatus("Finishing login…", null);
+        const resp = await msalInstance.handleRedirectPromise();
+        if (resp?.account) msalInstance.setActiveAccount?.(resp.account);
+      } catch (e) {
+        showBanner("handleRedirectPromise error:\n" + (e?.message || String(e)));
+      }
 
       function setUiFromAccount() {
         const active = msalInstance.getActiveAccount?.() || null;
@@ -212,27 +223,13 @@
         }
       }
 
-      try {
-        const resp = await msalInstance.handleRedirectPromise();
-        if (resp?.account) msalInstance.setActiveAccount?.(resp.account);
-      } catch (e) {
-        showBanner("handleRedirectPromise error:\n" + (e?.message || String(e)));
-      }
-
       setUiFromAccount();
 
       async function login() {
         hideBanner();
-        setStatus("Logging in…", null);
-        try {
-          const resp = await msalInstance.loginPopup(loginRequest);
-          if (resp?.account) msalInstance.setActiveAccount?.(resp.account);
-          setUiFromAccount();
-        } catch (e) {
-          const msg = e?.message || String(e);
-          setStatus("Login failed ❌", false);
-          showBanner("Login failed:\n" + msg);
-        }
+        setStatus("Redirecting to Microsoft login…", null);
+        // ✅ same-tab login (redirect)
+        await msalInstance.loginRedirect(loginRequest);
       }
 
       async function getToken() {
@@ -243,9 +240,11 @@
         try {
           const resp = await msalInstance.acquireTokenSilent({ ...loginRequest, account: acct });
           return resp.accessToken;
-        } catch {
-          const resp = await msalInstance.acquireTokenPopup({ ...loginRequest, account: acct });
-          return resp.accessToken;
+        } catch (e) {
+          // ✅ same-tab token prompt (redirect)
+          await msalInstance.acquireTokenRedirect({ ...loginRequest, account: acct });
+          // execution stops here because browser navigates away
+          throw new Error("Redirecting for token…");
         }
       }
 
@@ -312,12 +311,15 @@
           btnSend.disabled = !data.ready;
 
         } catch (e) {
+          // If we triggered acquireTokenRedirect, the page will navigate away; no need to show error
+          const msg = String(e?.message || e);
+          if (msg.includes("Redirecting for token")) return;
+
           setStatus("ERROR ❌", false);
-          showBanner(e?.message || String(e));
+          showBanner(msg);
         }
       });
 
-      // ✅ send payload to backend trigger (backend forwards to render webhook)
       btnSend.addEventListener("click", async () => {
         if (!lastCheck?.ready) return;
         setStatus("Sending…", null);
@@ -345,8 +347,6 @@
           btnSend.disabled = false;
         }
       });
-
-      setStatus("Ready (not logged in)", null);
     }
 
     bootMsal();
