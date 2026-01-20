@@ -229,8 +229,10 @@ function getBearerFromReq(req) {
 }
 
 /**
- * FAST: fetch messages WITH attachments using $expand=attachments(...)
- * FIX: removed contentId from select because base type microsoft.graph.attachment doesn't have it
+ * Fetch messages WITH attachments using $expand=attachments(...)
+ * Return BOTH:
+ *  - expected_all_unique (PDF + nonPDF, minus inline images)
+ *  - expected_pdf_unique (ONLY PDFs)   <-- used for READY + Missing/Extra
  */
 async function getExpectedOutlookKeys({ mailbox, date, logs, token, mode }) {
   logs.push({ t: nowIso(), step: "outlook.start", mailbox, date, mode });
@@ -267,7 +269,9 @@ async function getExpectedOutlookKeys({ mailbox, date, logs, token, mode }) {
 
   logs.push({ t: nowIso(), step: "outlook.messages_expand.total", count: messages.length });
 
-  const expected = [];
+  const expectedAll = [];
+  const expectedPdf = [];
+
   for (const m of messages) {
     const messageId = m.id;
     const atts = Array.isArray(m.attachments) ? m.attachments : [];
@@ -279,37 +283,56 @@ async function getExpectedOutlookKeys({ mailbox, date, logs, token, mode }) {
       const pdf = isPdf(a);
       const inlineish = a.isInline === true;
 
+      // Drop inline images/signatures etc.
       if (!pdf && inlineish && isImage(a)) continue;
 
-      expected.push({
+      const item = {
         messageId,
         attachmentId: a.id,
         name: a.name || "",
         contentType: a.contentType || "",
         isPdf: pdf,
         isInline: a.isInline === true,
-      });
+      };
+
+      expectedAll.push(item);
+      if (pdf) expectedPdf.push(item); // ONLY PDFs
     }
   }
 
-  const seen = new Set();
-  const uniq = [];
-  for (const e of expected) {
-    const k = `${e.messageId}::${e.attachmentId}`;
-    if (seen.has(k)) continue;
-    seen.add(k);
-    uniq.push(e);
+  function uniqByKey(arr) {
+    const seen = new Set();
+    const uniq = [];
+    for (const e of arr) {
+      const k = `${e.messageId}::${e.attachmentId}`;
+      if (seen.has(k)) continue;
+      seen.add(k);
+      uniq.push(e);
+    }
+    return uniq;
   }
+
+  const allUnique = uniqByKey(expectedAll);
+  const pdfUnique = uniqByKey(expectedPdf);
 
   logs.push({
     t: nowIso(),
-    step: "outlook.expected.unique_total",
-    expected_raw: expected.length,
-    expected_unique: uniq.length,
+    step: "outlook.expected.unique_totals",
+    all_raw: expectedAll.length,
+    all_unique: allUnique.length,
+    pdf_raw: expectedPdf.length,
+    pdf_unique: pdfUnique.length,
     usedBase,
   });
 
-  return { messages_count: messages.length, expected_unique: uniq, expected_raw_total: expected.length, usedBase };
+  return {
+    messages_count: messages.length,
+    expected_all_unique: allUnique,
+    expected_pdf_unique: pdfUnique,
+    expected_all_raw_total: expectedAll.length,
+    expected_pdf_raw_total: expectedPdf.length,
+    usedBase,
+  };
 }
 
 // ---------- Google Sheets via Service Account JWT ----------
@@ -643,26 +666,26 @@ export default async function handler(req, res) {
     const outlook = await getExpectedOutlookKeys({ mailbox, date, logs, token, mode });
     const sheets = await getSheetAttachmentsForDate({ spreadsheetId, recognizedTab, unrecognizedTab, date, logs });
 
-    const expectedSet = new Map();
-    for (const e of outlook.expected_unique) expectedSet.set(`${e.messageId}::${e.attachmentId}`, e);
+    // ✅ Compare ONLY PDFs for readiness & diffs
+    const expectedPdfSet = new Map();
+    for (const e of outlook.expected_pdf_unique) expectedPdfSet.set(`${e.messageId}::${e.attachmentId}`, e);
 
     const sheetsSet = new Map();
     for (const s of sheets.unique) sheetsSet.set(`${s.messageId}::${s.attachmentId}`, s);
 
     const missing = [];
-    for (const [k, e] of expectedSet.entries()) if (!sheetsSet.has(k)) missing.push(e);
+    for (const [k, e] of expectedPdfSet.entries()) if (!sheetsSet.has(k)) missing.push(e);
 
     const extra = [];
-    for (const [k, s] of sheetsSet.entries()) if (!expectedSet.has(k)) extra.push(s);
+    for (const [k, s] of sheetsSet.entries()) if (!expectedPdfSet.has(k)) extra.push(s);
 
     const ready = missing.length === 0 && extra.length === 0 && sheets.sheets_rows_missing_ids === 0;
 
-    // ✅ Payload for n8n: messageId + attachmentId (PDF invoices only)
+    // ✅ Payload to n8n: PDF invoices only
     const attachments = [];
     for (const [k, s] of sheetsSet.entries()) {
-      const e = expectedSet.get(k);
+      const e = expectedPdfSet.get(k);
       if (!e) continue;
-      if (!e.isPdf) continue; // invoices only
       attachments.push({
         messageId: e.messageId,
         attachmentId: e.attachmentId,
@@ -680,6 +703,9 @@ export default async function handler(req, res) {
       attachments,
     };
 
+    const outlookAll = outlook.expected_all_unique || [];
+    const outlookPdf = outlook.expected_pdf_unique || [];
+
     return res.status(200).json({
       ok: true,
       date,
@@ -689,13 +715,18 @@ export default async function handler(req, res) {
       usedBase: outlook.usedBase,
       messages_count: outlook.messages_count,
 
-      outlook_attachments_total: outlook.expected_unique.length,
+      // totals
+      outlook_attachments_total_all: outlookAll.length,
+      outlook_attachments_pdf_total: outlookPdf.length,
+      outlook_attachments_nonpdf_total: Math.max(0, outlookAll.length - outlookPdf.length),
+
+      // sheets totals
       sheets_attachments_total: sheets.sheets_total_rows_by_date,
       recognized_attachments: sheets.recognized.totalRowsByDate,
       unrecognized_attachments: sheets.unrecognized.totalRowsByDate,
-
       sheets_rows_missing_ids: sheets.sheets_rows_missing_ids,
 
+      // diffs (PDF-only)
       missing_count: missing.length,
       extra_count: extra.length,
 
@@ -704,7 +735,7 @@ export default async function handler(req, res) {
         attachmentId: x.attachmentId,
         name: x.name,
         contentType: x.contentType,
-        isPdf: x.isPdf,
+        isPdf: true,
         isInline: x.isInline,
       })),
       extra,
