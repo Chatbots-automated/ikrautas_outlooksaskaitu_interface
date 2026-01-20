@@ -24,6 +24,26 @@ function isImage(att) {
   return IMAGE_EXT.test(name);
 }
 
+// ✅ NEW: exclude these "equipment_document.compressed_file_for_email.*" junk images
+function isExcludedJunkAttachment(att) {
+  const name = String(att?.name || "").toLowerCase();
+  const ct = String(att?.contentType || "").toLowerCase();
+
+  // match exactly what you showed
+  if (name.startsWith("equipment_document.compressed_file_for_email.")) return true;
+
+  // optional extra safety: those are always jpg/jpeg in your case
+  // (keeps behavior tight; remove if you want only-name check)
+  if (
+    (ct === "image/jpeg" || ct === "image/jpg") &&
+    name.includes("compressed_file_for_email")
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
 function utcStartEndExclusive(dateYYYYMMDD) {
   const [y, m, d] = dateYYYYMMDD.split("-").map(Number);
   const start = new Date(Date.UTC(y, m - 1, d, 0, 0, 0));
@@ -229,10 +249,8 @@ function getBearerFromReq(req) {
 }
 
 /**
- * Fetch messages WITH attachments using $expand=attachments(...)
- * Return BOTH:
- *  - expected_all_unique (PDF + nonPDF, minus inline images)
- *  - expected_pdf_unique (ONLY PDFs)   <-- used for READY + Missing/Extra
+ * FAST: fetch messages WITH attachments using $expand=attachments(...)
+ * FIX: removed contentId from select because base type microsoft.graph.attachment doesn't have it
  */
 async function getExpectedOutlookKeys({ mailbox, date, logs, token, mode }) {
   logs.push({ t: nowIso(), step: "outlook.start", mailbox, date, mode });
@@ -269,9 +287,9 @@ async function getExpectedOutlookKeys({ mailbox, date, logs, token, mode }) {
 
   logs.push({ t: nowIso(), step: "outlook.messages_expand.total", count: messages.length });
 
-  const expectedAll = [];
-  const expectedPdf = [];
+  let excludedJunkCount = 0;
 
+  const expected = [];
   for (const m of messages) {
     const messageId = m.id;
     const atts = Array.isArray(m.attachments) ? m.attachments : [];
@@ -280,59 +298,48 @@ async function getExpectedOutlookKeys({ mailbox, date, logs, token, mode }) {
       const otype = a["@odata.type"] || "#microsoft.graph.fileAttachment";
       if (!String(otype).toLowerCase().endsWith("fileattachment")) continue;
 
+      // ✅ NEW: ignore those equipment_document.compressed_file_for_email.* jpgs
+      if (isExcludedJunkAttachment(a)) {
+        excludedJunkCount += 1;
+        continue;
+      }
+
       const pdf = isPdf(a);
       const inlineish = a.isInline === true;
 
-      // Drop inline images/signatures etc.
+      // keep existing inline-image skipping
       if (!pdf && inlineish && isImage(a)) continue;
 
-      const item = {
+      expected.push({
         messageId,
         attachmentId: a.id,
         name: a.name || "",
         contentType: a.contentType || "",
         isPdf: pdf,
         isInline: a.isInline === true,
-      };
-
-      expectedAll.push(item);
-      if (pdf) expectedPdf.push(item); // ONLY PDFs
+      });
     }
   }
 
-  function uniqByKey(arr) {
-    const seen = new Set();
-    const uniq = [];
-    for (const e of arr) {
-      const k = `${e.messageId}::${e.attachmentId}`;
-      if (seen.has(k)) continue;
-      seen.add(k);
-      uniq.push(e);
-    }
-    return uniq;
+  const seen = new Set();
+  const uniq = [];
+  for (const e of expected) {
+    const k = `${e.messageId}::${e.attachmentId}`;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    uniq.push(e);
   }
-
-  const allUnique = uniqByKey(expectedAll);
-  const pdfUnique = uniqByKey(expectedPdf);
 
   logs.push({
     t: nowIso(),
-    step: "outlook.expected.unique_totals",
-    all_raw: expectedAll.length,
-    all_unique: allUnique.length,
-    pdf_raw: expectedPdf.length,
-    pdf_unique: pdfUnique.length,
+    step: "outlook.expected.unique_total",
+    expected_raw: expected.length,
+    expected_unique: uniq.length,
+    excluded_junk_count: excludedJunkCount, // ✅ debug visibility
     usedBase,
   });
 
-  return {
-    messages_count: messages.length,
-    expected_all_unique: allUnique,
-    expected_pdf_unique: pdfUnique,
-    expected_all_raw_total: expectedAll.length,
-    expected_pdf_raw_total: expectedPdf.length,
-    usedBase,
-  };
+  return { messages_count: messages.length, expected_unique: uniq, expected_raw_total: expected.length, usedBase };
 }
 
 // ---------- Google Sheets via Service Account JWT ----------
@@ -666,26 +673,26 @@ export default async function handler(req, res) {
     const outlook = await getExpectedOutlookKeys({ mailbox, date, logs, token, mode });
     const sheets = await getSheetAttachmentsForDate({ spreadsheetId, recognizedTab, unrecognizedTab, date, logs });
 
-    // ✅ Compare ONLY PDFs for readiness & diffs
-    const expectedPdfSet = new Map();
-    for (const e of outlook.expected_pdf_unique) expectedPdfSet.set(`${e.messageId}::${e.attachmentId}`, e);
+    const expectedSet = new Map();
+    for (const e of outlook.expected_unique) expectedSet.set(`${e.messageId}::${e.attachmentId}`, e);
 
     const sheetsSet = new Map();
     for (const s of sheets.unique) sheetsSet.set(`${s.messageId}::${s.attachmentId}`, s);
 
     const missing = [];
-    for (const [k, e] of expectedPdfSet.entries()) if (!sheetsSet.has(k)) missing.push(e);
+    for (const [k, e] of expectedSet.entries()) if (!sheetsSet.has(k)) missing.push(e);
 
     const extra = [];
-    for (const [k, s] of sheetsSet.entries()) if (!expectedPdfSet.has(k)) extra.push(s);
+    for (const [k, s] of sheetsSet.entries()) if (!expectedSet.has(k)) extra.push(s);
 
     const ready = missing.length === 0 && extra.length === 0 && sheets.sheets_rows_missing_ids === 0;
 
-    // ✅ Payload to n8n: PDF invoices only
+    // ✅ Payload for n8n: messageId + attachmentId (PDF invoices only)
     const attachments = [];
     for (const [k, s] of sheetsSet.entries()) {
-      const e = expectedPdfSet.get(k);
+      const e = expectedSet.get(k);
       if (!e) continue;
+      if (!e.isPdf) continue; // invoices only
       attachments.push({
         messageId: e.messageId,
         attachmentId: e.attachmentId,
@@ -703,9 +710,6 @@ export default async function handler(req, res) {
       attachments,
     };
 
-    const outlookAll = outlook.expected_all_unique || [];
-    const outlookPdf = outlook.expected_pdf_unique || [];
-
     return res.status(200).json({
       ok: true,
       date,
@@ -715,18 +719,13 @@ export default async function handler(req, res) {
       usedBase: outlook.usedBase,
       messages_count: outlook.messages_count,
 
-      // totals
-      outlook_attachments_total_all: outlookAll.length,
-      outlook_attachments_pdf_total: outlookPdf.length,
-      outlook_attachments_nonpdf_total: Math.max(0, outlookAll.length - outlookPdf.length),
-
-      // sheets totals
+      outlook_attachments_total: outlook.expected_unique.length,
       sheets_attachments_total: sheets.sheets_total_rows_by_date,
       recognized_attachments: sheets.recognized.totalRowsByDate,
       unrecognized_attachments: sheets.unrecognized.totalRowsByDate,
+
       sheets_rows_missing_ids: sheets.sheets_rows_missing_ids,
 
-      // diffs (PDF-only)
       missing_count: missing.length,
       extra_count: extra.length,
 
@@ -735,7 +734,7 @@ export default async function handler(req, res) {
         attachmentId: x.attachmentId,
         name: x.name,
         contentType: x.contentType,
-        isPdf: true,
+        isPdf: x.isPdf,
         isInline: x.isInline,
       })),
       extra,
