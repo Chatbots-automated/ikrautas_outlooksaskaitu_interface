@@ -1,355 +1,781 @@
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Ikrautas – Invoice Batch Verifier</title>
+// api/check.js (FULL)
+// GET /api/check?date=YYYY-MM-DD&debug=1
+// - Microsoft Graph: prefers DELEGATED token from Authorization header,
+//   falls back to client_credentials if no Authorization header.
+// - Google Sheets API: Service Account JWT (GOOGLE_SA_CLIENT_EMAIL + GOOGLE_SA_PRIVATE_KEY)
 
-  <style>
-    body { font-family: ui-sans-serif, system-ui, Arial; margin: 24px; }
-    .row { display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
-    input, button { padding:10px 12px; font-size:14px; }
-    button { cursor:pointer; }
-    .card { border:1px solid #ddd; border-radius:12px; padding:16px; margin-top:16px; }
-    .ok { color: #0a7b2f; font-weight: 800; }
-    .bad { color: #b00020; font-weight: 800; }
-    .muted { color: #666; }
-    table { width: 100%; border-collapse: collapse; margin-top: 12px; }
-    th, td { border-bottom:1px solid #eee; padding:8px; text-align:left; font-size: 13px; }
-    .pill { display:inline-block; padding:4px 10px; border-radius:999px; background:#f3f3f3; }
-    pre { background:#0b0b0b; color:#e7e7e7; padding:12px; border-radius:10px; overflow:auto; }
-    .btn-primary { background:#111; color:#fff; border: none; border-radius:10px; }
-    .btn-secondary { background:#f3f3f3; border:1px solid #ddd; border-radius:10px; }
-    .btn-primary:disabled, .btn-secondary:disabled { opacity:0.5; cursor:not-allowed; }
-    .small { font-size:12px; }
-    .banner { display:none; border:1px solid #ffd6d6; background:#fff3f3; color:#7a0010; padding:12px; border-radius:10px; margin-top:12px; white-space:pre-wrap; }
-  </style>
+export const runtime = "nodejs";
 
-  <!-- MSAL primary CDN -->
-  <script src="https://cdn.jsdelivr.net/npm/@azure/msal-browser@2.38.3/lib/msal-browser.min.js"></script>
+import crypto from "crypto";
 
-  <!-- Fallback if jsdelivr blocked -->
-  <script>
-    (function () {
-      function load(src) {
-        return new Promise((resolve, reject) => {
-          const s = document.createElement('script');
-          s.src = src;
-          s.async = true;
-          s.onload = resolve;
-          s.onerror = reject;
-          document.head.appendChild(s);
+const IMAGE_EXT = /\.(png|jpe?g|gif|bmp|tiff?|webp|heic|heif|svg)$/i;
+const FETCH_TIMEOUT_MS = Number(process.env.FETCH_TIMEOUT_MS || 12000);
+
+// ---------- helpers ----------
+function isPdf(att) {
+  const ct = String(att.contentType || "").toLowerCase();
+  const name = String(att.name || "");
+  return ct.includes("application/pdf") || /\.pdf$/i.test(name);
+}
+
+function isImage(att) {
+  const ct = String(att.contentType || "").toLowerCase();
+  const name = String(att.name || "").toLowerCase();
+  if (ct.startsWith("image/")) return true;
+  return IMAGE_EXT.test(name);
+}
+
+function utcStartEndExclusive(dateYYYYMMDD) {
+  const [y, m, d] = dateYYYYMMDD.split("-").map(Number);
+  const start = new Date(Date.UTC(y, m - 1, d, 0, 0, 0));
+  const end = new Date(Date.UTC(y, m - 1, d + 1, 0, 0, 0));
+  return { start: start.toISOString(), end: end.toISOString() };
+}
+
+function safeTruncate(s, max = 1200) {
+  const str = String(s ?? "");
+  return str.length > max ? str.slice(0, max) + "…(truncated)" : str;
+}
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function decodeJwtClaims(accessToken) {
+  try {
+    const parts = String(accessToken || "").split(".");
+    if (parts.length < 2) return null;
+    const payload = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    const json = Buffer.from(payload, "base64").toString("utf8");
+    const claims = JSON.parse(json);
+    return {
+      aud: claims.aud,
+      iss: claims.iss,
+      tid: claims.tid,
+      appid: claims.appid,
+      upn: claims.upn || null,
+      preferred_username: claims.preferred_username || null,
+      roles: claims.roles || null,
+      scp: claims.scp || null,
+      exp: claims.exp || null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function randId() {
+  try {
+    return crypto.randomUUID();
+  } catch {
+    return "req_" + Math.random().toString(16).slice(2);
+  }
+}
+
+async function fetchWithMeta(url, opts = {}) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+
+  let r;
+  try {
+    r = await fetch(url, { ...opts, signal: controller.signal });
+  } catch (e) {
+    clearTimeout(id);
+    return {
+      ok: false,
+      status: 0,
+      statusText: e?.name === "AbortError" ? "Fetch timeout" : "Fetch error",
+      url,
+      headers: {},
+      text: e?.message ? String(e.message) : String(e),
+      json: null,
+    };
+  }
+
+  clearTimeout(id);
+
+  const text = await r.text();
+  const headers = {};
+  r.headers.forEach((v, k) => (headers[k.toLowerCase()] = v));
+
+  let json = null;
+  try {
+    json = text ? JSON.parse(text) : {};
+  } catch {
+    json = null;
+  }
+
+  return { ok: r.ok, status: r.status, statusText: r.statusText, url, headers, text, json };
+}
+
+async function fetchJsonOrThrow(url, opts, logs, stepName) {
+  const started = Date.now();
+  const meta = await fetchWithMeta(url, opts);
+
+  logs.push({
+    t: nowIso(),
+    step: stepName,
+    url,
+    status: meta.status,
+    ok: meta.ok,
+    request_id: meta.headers["request-id"] || null,
+    client_request_id: opts?.headers?.["client-request-id"] || null,
+    duration_ms: Date.now() - started,
+    "x-ms-ags-diagnostic": meta.headers["x-ms-ags-diagnostic"]
+      ? safeTruncate(meta.headers["x-ms-ags-diagnostic"], 600)
+      : null,
+  });
+
+  if (!meta.ok) {
+    const body = meta.json ?? meta.text;
+    const err = new Error(
+      `${meta.status} ${meta.statusText}: ${safeTruncate(
+        typeof body === "string" ? body : JSON.stringify(body)
+      )}`
+    );
+    err.__httpStatus = meta.status || 500;
+    throw err;
+  }
+
+  if (meta.json !== null) return meta.json;
+  throw new Error(`Non-JSON response: ${safeTruncate(meta.text)}`);
+}
+
+// ✅ safe paging (cap + loop detection)
+async function fetchAllPagedGraph(token, firstUrl, logs, stepPrefix, maxPages = 10) {
+  const out = [];
+  let url = firstUrl;
+  let page = 0;
+  const seen = new Set();
+
+  while (url) {
+    if (seen.has(url)) {
+      logs.push({ t: nowIso(), step: `${stepPrefix}.paging.loop_detected`, url });
+      break;
+    }
+    seen.add(url);
+
+    page += 1;
+    if (page > maxPages) {
+      logs.push({ t: nowIso(), step: `${stepPrefix}.paging.page_cap_hit`, maxPages });
+      break;
+    }
+
+    const clientRequestId = randId();
+    const json = await fetchJsonOrThrow(
+      url,
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: "application/json",
+          "client-request-id": clientRequestId,
+        },
+      },
+      logs,
+      `${stepPrefix}.page_${page}`
+    );
+
+    if (Array.isArray(json.value)) out.push(...json.value);
+    url = json["@odata.nextLink"] || null;
+
+    logs.push({
+      t: nowIso(),
+      step: `${stepPrefix}.page_${page}.count`,
+      items_in_page: Array.isArray(json.value) ? json.value.length : 0,
+      total_so_far: out.length,
+    });
+  }
+
+  return out;
+}
+
+// ---------- Microsoft Graph ----------
+async function getGraphTokenAppOnly(logs) {
+  const tenant = process.env.MS_TENANT_ID;
+  const clientId = process.env.MS_CLIENT_ID;
+  const clientSecret = process.env.MS_CLIENT_SECRET;
+
+  if (!tenant || !clientId || !clientSecret) {
+    throw new Error("Missing MS_TENANT_ID / MS_CLIENT_ID / MS_CLIENT_SECRET");
+  }
+
+  const tokenUrl = `https://login.microsoftonline.com/${encodeURIComponent(tenant)}/oauth2/v2.0/token`;
+
+  const body = new URLSearchParams();
+  body.set("grant_type", "client_credentials");
+  body.set("client_id", clientId);
+  body.set("client_secret", clientSecret);
+  body.set("scope", "https://graph.microsoft.com/.default");
+
+  const meta = await fetchWithMeta(tokenUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body,
+  });
+
+  logs.push({ t: nowIso(), step: "graph.token.app_only", status: meta.status, ok: meta.ok });
+
+  if (!meta.ok) throw new Error(`Token error ${meta.status}: ${safeTruncate(meta.text)}`);
+
+  const json = meta.json || JSON.parse(meta.text || "{}");
+  const token = json.access_token;
+  logs.push({ t: nowIso(), step: "graph.token.app_only.claims", claims: decodeJwtClaims(token) });
+  return token;
+}
+
+function getBearerFromReq(req) {
+  const auth = req.headers?.authorization || req.headers?.Authorization || "";
+  const m = String(auth).match(/^Bearer\s+(.+)$/i);
+  return m ? m[1].trim() : null;
+}
+
+/**
+ * FAST: fetch messages WITH attachments using $expand=attachments(...)
+ * FIX: removed contentId from select because base type microsoft.graph.attachment doesn't have it
+ */
+async function getExpectedOutlookKeys({ mailbox, date, logs, token, mode }) {
+  logs.push({ t: nowIso(), step: "outlook.start", mailbox, date, mode });
+
+  const { start, end } = utcStartEndExclusive(date);
+  logs.push({ t: nowIso(), step: "outlook.date_window_utc", start, end });
+
+  const usedBase = `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(mailbox)}`;
+
+  const messagesUrl =
+    `${usedBase}/messages?` +
+    `$select=id,receivedDateTime,hasAttachments&` +
+    `$expand=attachments($select=id,name,contentType,isInline)&` +
+    `$filter=hasAttachments eq true and receivedDateTime ge ${start} and receivedDateTime lt ${end}&` +
+    `$top=50`;
+
+  logs.push({ t: nowIso(), step: "outlook.messages.expand.url", messagesUrl, usedBase });
+
+  let messages;
+  try {
+    messages = await fetchAllPagedGraph(token, messagesUrl, logs, "outlook.messages_expand", 10);
+  } catch (e) {
+    const status = e?.__httpStatus;
+    if (mode === "delegated" && (status === 401 || status === 403)) {
+      const msg =
+        `Delegated token cannot read mailbox "${mailbox}". ` +
+        `Login with a user that has access to this shared mailbox (Full Access). Raw: ${String(e.message || e)}`;
+      const err = new Error(msg);
+      err.__httpStatus = status;
+      throw err;
+    }
+    throw e;
+  }
+
+  logs.push({ t: nowIso(), step: "outlook.messages_expand.total", count: messages.length });
+
+  const expected = [];
+  for (const m of messages) {
+    const messageId = m.id;
+    const atts = Array.isArray(m.attachments) ? m.attachments : [];
+
+    for (const a of atts) {
+      const otype = a["@odata.type"] || "#microsoft.graph.fileAttachment";
+      if (!String(otype).toLowerCase().endsWith("fileattachment")) continue;
+
+      const pdf = isPdf(a);
+      const inlineish = a.isInline === true;
+
+      // keep as-is: ignore inline images, but keep non-inline images (you decided earlier)
+      if (!pdf && inlineish && isImage(a)) continue;
+
+      expected.push({
+        messageId,
+        attachmentId: a.id,
+        name: a.name || "",
+        contentType: a.contentType || "",
+        isPdf: pdf,
+        isInline: a.isInline === true,
+      });
+    }
+  }
+
+  const seen = new Set();
+  const uniq = [];
+  for (const e of expected) {
+    const k = `${e.messageId}::${e.attachmentId}`;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    uniq.push(e);
+  }
+
+  logs.push({
+    t: nowIso(),
+    step: "outlook.expected.unique_total",
+    expected_raw: expected.length,
+    expected_unique: uniq.length,
+    usedBase,
+  });
+
+  return { messages_count: messages.length, expected_unique: uniq, expected_raw_total: expected.length, usedBase };
+}
+
+// ---------- Google Sheets via Service Account JWT ----------
+function base64UrlEncode(bufOrStr) {
+  const b = Buffer.isBuffer(bufOrStr) ? bufOrStr : Buffer.from(String(bufOrStr));
+  return b.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function signJwtRS256({ header, payload, privateKeyPem }) {
+  const encodedHeader = base64UrlEncode(JSON.stringify(header));
+  const encodedPayload = base64UrlEncode(JSON.stringify(payload));
+  const data = `${encodedHeader}.${encodedPayload}`;
+
+  const signer = crypto.createSign("RSA-SHA256");
+  signer.update(data);
+  signer.end();
+
+  const signature = signer.sign(privateKeyPem);
+  return `${data}.${base64UrlEncode(signature)}`;
+}
+
+async function getGoogleAccessTokenServiceAccount(logs) {
+  const clientEmail = process.env.GOOGLE_SA_CLIENT_EMAIL;
+  let privateKey = process.env.GOOGLE_SA_PRIVATE_KEY;
+
+  if (!clientEmail || !privateKey) {
+    throw new Error("Missing GOOGLE_SA_CLIENT_EMAIL / GOOGLE_SA_PRIVATE_KEY");
+  }
+
+  privateKey = privateKey.replace(/\\n/g, "\n");
+
+  const now = Math.floor(Date.now() / 1000);
+  const tokenUrl = "https://oauth2.googleapis.com/token";
+
+  const assertion = signJwtRS256({
+    header: { alg: "RS256", typ: "JWT" },
+    payload: {
+      iss: clientEmail,
+      scope: "https://www.googleapis.com/auth/spreadsheets.readonly",
+      aud: tokenUrl,
+      iat: now,
+      exp: now + 3600,
+    },
+    privateKeyPem: privateKey,
+  });
+
+  const body = new URLSearchParams();
+  body.set("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer");
+  body.set("assertion", assertion);
+
+  const meta = await fetchWithMeta(tokenUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body,
+  });
+
+  logs.push({ t: nowIso(), step: "google.sa.token", status: meta.status, ok: meta.ok });
+
+  if (!meta.ok) throw new Error(`Google SA token error ${meta.status}: ${safeTruncate(meta.text)}`);
+
+  const json = meta.json || JSON.parse(meta.text || "{}");
+  if (!json.access_token) throw new Error("Google SA token response missing access_token");
+  return json.access_token;
+}
+
+async function sheetsValuesGet(accessToken, spreadsheetId, rangeA1, logs) {
+  const url =
+    `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(spreadsheetId)}/values/${encodeURIComponent(
+      rangeA1
+    )}` + `?majorDimension=ROWS`;
+
+  logs.push({ t: nowIso(), step: "sheets.values.url", url });
+
+  return fetchJsonOrThrow(url, { headers: { Authorization: `Bearer ${accessToken}` } }, logs, "sheets.values.get");
+}
+
+function indexByHeader(headers) {
+  const map = {};
+  headers.forEach((h, i) => (map[String(h || "").trim().toLowerCase()] = i));
+  return map;
+}
+
+function pickIdx(map, names) {
+  for (const n of names) {
+    const idx = map[n.toLowerCase()];
+    if (idx !== undefined) return idx;
+  }
+  return -1;
+}
+
+function normalizeToYMD(v) {
+  if (v === null || v === undefined) return null;
+  const s = String(v).trim();
+  if (!s) return null;
+
+  if (/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0, 10);
+
+  if (/^\d+(\.\d+)?$/.test(s)) {
+    const n = Number(s);
+    if (Number.isFinite(n) && n > 1000) {
+      const ms = Math.round((n - 25569) * 86400 * 1000);
+      const d = new Date(ms);
+      if (!isNaN(d.getTime())) return d.toISOString().slice(0, 10);
+    }
+  }
+
+  let m = s.match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})/);
+  if (m) {
+    const dd = String(m[1]).padStart(2, "0");
+    const mm = String(m[2]).padStart(2, "0");
+    const yy = m[3];
+    return `${yy}-${mm}-${dd}`;
+  }
+
+  m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+  if (m) {
+    const dd = String(m[1]).padStart(2, "0");
+    const mm = String(m[2]).padStart(2, "0");
+    const yy = m[3];
+    return `${yy}-${mm}-${dd}`;
+  }
+
+  const t = Date.parse(s);
+  if (!Number.isNaN(t)) return new Date(t).toISOString().slice(0, 10);
+
+  return null;
+}
+
+function rowBelongsToDate({ row, idxDate, date, scanCellsCount = 12 }) {
+  const v = idxDate >= 0 ? row[idxDate] : null;
+  const ymd = normalizeToYMD(v);
+
+  if (ymd === date) return true;
+  if (ymd !== null) return false;
+
+  const lim = Math.min(row.length, scanCellsCount);
+  for (let i = 0; i < lim; i++) {
+    const cell = String(row[i] ?? "");
+    if (!cell) continue;
+    if (cell.includes(date)) return true;
+  }
+  return false;
+}
+
+function isMarkedDuplicate(cell) {
+  return String(cell || "").trim().toUpperCase() === "DUPLICATE";
+}
+
+async function getSheetAttachmentsForDate({ spreadsheetId, recognizedTab, unrecognizedTab, date, logs }) {
+  logs.push({ t: nowIso(), step: "sheets.start", spreadsheetId, recognizedTab, unrecognizedTab, date });
+
+  const accessToken = await getGoogleAccessTokenServiceAccount(logs);
+
+  async function readTab(tabName) {
+    const range = `${tabName}!A:ZZ`;
+    const resp = await sheetsValuesGet(accessToken, spreadsheetId, range, logs);
+    const values = resp.values || [];
+    logs.push({ t: nowIso(), step: "sheets.tab.read", tabName, rows: values.length, range });
+    if (values.length < 2) return { headers: [], rows: [] };
+    return { headers: values[0], rows: values.slice(1) };
+  }
+
+  const rec = await readTab(recognizedTab);
+  const unr = await readTab(unrecognizedTab);
+
+  function extract(tab) {
+    const map = indexByHeader(tab.headers);
+
+    const idxDate = pickIdx(map, ["data", "date", "timestamp"]);
+    const idxMsg = pickIdx(map, ["messageid", "message id", "message_id"]);
+    const idxAtt = pickIdx(map, ["attachmentid", "attachment id", "attachment_id"]);
+    const idxDup = pickIdx(map, ["duplicate", "duplicates", "dup", "status"]);
+    const idxName = pickIdx(map, [
+      "originalus failo pavadinimas",
+      "original filename",
+      "filename",
+      "file name",
+      "pavadinimas",
+      "failas",
+    ]);
+
+    if (idxDate < 0) throw new Error("Sheets must contain a date column named Data/Date/Timestamp");
+
+    let totalRowsByDate = 0;
+    let rowsMissingIds = 0;
+
+    const allWithIds = [];
+    const markedDuplicates = [];
+
+    for (const r of tab.rows) {
+      if (!rowBelongsToDate({ row: r, idxDate, date })) continue;
+
+      totalRowsByDate += 1;
+
+      const messageId = idxMsg >= 0 ? (r[idxMsg] || "") : "";
+      const attachmentId = idxAtt >= 0 ? (r[idxAtt] || "") : "";
+      const name = idxName >= 0 ? String(r[idxName] || "") : "";
+
+      const dupMarked = idxDup >= 0 ? isMarkedDuplicate(r[idxDup]) : false;
+      if (dupMarked && messageId && attachmentId) markedDuplicates.push({ messageId, attachmentId, name });
+
+      if (!messageId || !attachmentId) {
+        rowsMissingIds += 1;
+        continue;
+      }
+
+      allWithIds.push({ messageId, attachmentId, name });
+    }
+
+    const seen = new Set();
+    const unique = [];
+    for (const x of allWithIds) {
+      const k = `${x.messageId}::${x.attachmentId}`;
+      if (seen.has(k)) continue;
+      seen.add(k);
+      unique.push(x);
+    }
+
+    const collisions = allWithIds.length - unique.length;
+
+    return {
+      totalRowsByDate,
+      rowsMissingIds,
+      unique,
+      collisions,
+      markedDuplicatesCount: markedDuplicates.length,
+    };
+  }
+
+  const recognized = extract(rec);
+  const unrecognized = extract(unr);
+
+  const allUniquePool = [...recognized.unique, ...unrecognized.unique];
+  const seen = new Set();
+  const unique = [];
+  for (const x of allUniquePool) {
+    const k = `${x.messageId}::${x.attachmentId}`;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    unique.push(x);
+  }
+
+  return {
+    recognized,
+    unrecognized,
+    unique,
+    sheets_total_rows_by_date: recognized.totalRowsByDate + unrecognized.totalRowsByDate,
+    sheets_rows_missing_ids: recognized.rowsMissingIds + unrecognized.rowsMissingIds,
+    unique_keys_total: unique.length,
+    collisions_total: recognized.collisions + unrecognized.collisions,
+  };
+}
+
+// ---------- handler ----------
+export default async function handler(req, res) {
+  const debug = String(req.query.debug || "") === "1";
+  const logs = [];
+
+  try {
+    // ✅ Browser config (non-secret)
+    if (req.method === "GET" && String(req.query.config || "") === "1") {
+      return res.status(200).json({
+        ok: true,
+        MS_TENANT_ID: process.env.MS_TENANT_ID || null,
+        MS_CLIENT_ID: process.env.MS_CLIENT_ID || null,
+      });
+    }
+
+    // ✅ Trigger to n8n (same file, no new routes)
+    if (req.method === "POST" && String(req.query.trigger || "") === "1") {
+      const webhookUrl =
+        process.env.N8N_WEBHOOK_URL ||
+        "https://n8n-up8s.onrender.com/webhook/acf87dd7-5013-447e-9f05-d8087ace49c1";
+
+      const body = req.body || {};
+
+      if (!body || typeof body !== "object") {
+        return res.status(400).json({ ok: false, error: "Missing JSON body" });
+      }
+      if (!Array.isArray(body.attachments) || body.attachments.length === 0) {
+        return res.status(400).json({ ok: false, error: "payload.attachments must be a non-empty array" });
+      }
+
+      const meta = await fetchWithMeta(webhookUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+
+      logs.push({ t: nowIso(), step: "n8n.forward", url: webhookUrl, status: meta.status, ok: meta.ok });
+
+      if (!meta.ok) {
+        return res.status(502).json({
+          ok: false,
+          error: `n8n webhook failed ${meta.status}: ${safeTruncate(meta.text)}`,
+          ...(debug ? { logs } : {}),
         });
       }
-      if (!window.msal) {
-        load("https://alcdn.msauth.net/browser/2.38.3/js/msal-browser.min.js")
-          .catch(() => load("https://unpkg.com/@azure/msal-browser@2.38.3/lib/msal-browser.min.js"))
-          .catch(() => console.error("MSAL failed to load from all CDNs"));
-      }
-    })();
-  </script>
-</head>
 
-<body>
-  <h1>Invoice Batch Verifier</h1>
-  <p class="muted">
-    Matching uses <b>MessageId + AttachmentId</b> (internal).<br/>
-    The UI shows total attachments from Outlook and total rows from Sheets (including duplicates).
-  </p>
-
-  <div class="row">
-    <label>Date (UTC):</label>
-    <input id="date" type="date" />
-
-    <button class="btn-secondary" id="btnLogin">Login (Microsoft)</button>
-    <button class="btn-secondary" id="btnCheck" disabled>Check batch</button>
-    <button class="btn-primary" id="btnSend" disabled>Send to n8n</button>
-
-    <span id="statusPill" class="pill muted">Booting…</span>
-  </div>
-
-  <div id="banner" class="banner"></div>
-
-  <div class="card" id="summaryCard" style="display:none;">
-    <h3>Summary</h3>
-    <div id="summary"></div>
-    <h3>Payload</h3>
-    <pre id="payload"></pre>
-    <div class="muted small">
-      This payload is what gets POSTed to your n8n webhook when you click “Send to n8n”.
-    </div>
-  </div>
-
-  <div class="card" id="detailsCard" style="display:none;">
-    <h3>Details</h3>
-    <div id="details"></div>
-  </div>
-
-  <script>
-    const banner = document.getElementById('banner');
-    function showBanner(msg) { banner.style.display = 'block'; banner.textContent = msg; }
-    window.addEventListener('error', (e) => { showBanner("JS error:\n" + (e?.error?.stack || e?.message || String(e))); });
-    window.addEventListener('unhandledrejection', (e) => { showBanner("Unhandled promise:\n" + (e?.reason?.stack || e?.reason || String(e))); });
-
-    // pulled from /api/check?config=1
-    let MS_TENANT_ID = null;
-    let MS_CLIENT_ID = null;
-
-    const dateEl = document.getElementById('date');
-    const btnLogin = document.getElementById('btnLogin');
-    const btnCheck = document.getElementById('btnCheck');
-    const btnSend = document.getElementById('btnSend');
-    const statusPill = document.getElementById('statusPill');
-
-    const summaryCard = document.getElementById('summaryCard');
-    const detailsCard = document.getElementById('detailsCard');
-    const summaryEl = document.getElementById('summary');
-    const payloadEl = document.getElementById('payload');
-    const detailsEl = document.getElementById('details');
-
-    function setStatus(text, ok=null) {
-      statusPill.textContent = text;
-      statusPill.className = 'pill ' + (ok === true ? 'ok' : ok === false ? 'bad' : 'muted');
-    }
-    function hideBanner(){ banner.style.display='none'; banner.textContent=''; }
-
-    setStatus("JS loaded ✅", null);
-
-    const now = new Date();
-    dateEl.value = `${now.getUTCFullYear()}-${String(now.getUTCMonth()+1).padStart(2,'0')}-${String(now.getUTCDate()).padStart(2,'0')}`;
-
-    let lastCheck = null;
-
-    function escapeHtml(s) {
-      return String(s).replace(/[&<>"']/g, c => ({
-        '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
-      }[c]));
+      return res.status(200).json({
+        ok: true,
+        status: meta.status,
+        response: meta.json ?? meta.text,
+        ...(debug ? { logs } : {}),
+      });
     }
 
-    function renderKeyTable(list) {
-      if (!list || list.length === 0) return '<div class="muted">None</div>';
-      const rows = list.slice(0, 200).map(x => `
-        <tr>
-          <td>${escapeHtml(x.messageId || '')}</td>
-          <td>${escapeHtml(x.attachmentId || '')}</td>
-          <td>${escapeHtml(x.name || '')}</td>
-          <td>${escapeHtml(x.contentType || '')}</td>
-        </tr>`).join('');
-      return `
-        <table>
-          <thead><tr><th>messageId</th><th>attachmentId</th><th>name</th><th>contentType</th></tr></thead>
-          <tbody>${rows}</tbody>
-        </table>
-        ${list.length > 200 ? `<div class="muted">Showing first 200 of ${list.length}</div>` : ''}`;
-    }
+    // ✅ NEW: Notify Gratas via n8n (email)
+    if (req.method === "POST" && String(req.query.notify || "") === "1") {
+      const webhookUrl =
+        process.env.N8N_NOTIFY_URL ||
+        "https://n8n-up8s.onrender.com/webhook/REPLACE_WITH_NOTIFY_WEBHOOK_ID";
 
-    async function bootMsal() {
-      // wait for msal lib
-      for (let i = 0; i < 60; i++) {
-        if (window.msal) break;
-        await new Promise(r => setTimeout(r, 50));
+      const body = req.body || {};
+
+      if (!body || typeof body !== "object") {
+        return res.status(400).json({ ok: false, error: "Missing JSON body" });
+      }
+      if (!Array.isArray(body.attachments) || body.attachments.length === 0) {
+        return res.status(400).json({ ok: false, error: "payload.attachments must be a non-empty array" });
       }
 
-      if (!window.msal) {
-        setStatus("MSAL not loaded ❌", false);
-        showBanner("MSAL library failed to load.\nDisable AdBlock/Brave shields or try another network.");
-        btnLogin.disabled = true;
-        return;
-      }
-
-      // fetch tenant/client from server env
-      setStatus("Loading config…", null);
-      try {
-        const cfgRes = await fetch('/api/check?config=1', { cache: "no-store" });
-        const cfg = await cfgRes.json().catch(() => ({}));
-
-        if (!cfgRes.ok || !cfg.ok) {
-          throw new Error(cfg?.error || `Config request failed (${cfgRes.status})`);
-        }
-
-        MS_TENANT_ID = cfg.MS_TENANT_ID;
-        MS_CLIENT_ID = cfg.MS_CLIENT_ID;
-
-        if (!MS_TENANT_ID || !MS_CLIENT_ID) {
-          throw new Error("Missing MS_TENANT_ID / MS_CLIENT_ID in server env");
-        }
-      } catch (e) {
-        setStatus("Config error ❌", false);
-        showBanner(e?.message || String(e));
-        btnLogin.disabled = true;
-        btnCheck.disabled = true;
-        btnSend.disabled = true;
-        return;
-      }
-
-      const msalConfig = {
-        auth: {
-          clientId: MS_CLIENT_ID,
-          authority: `https://login.microsoftonline.com/${MS_TENANT_ID}`,
-          redirectUri: window.location.origin + "/",
-          // ✅ helps keep navigation in the same tab for redirect flows
-          navigateToLoginRequestUrl: false,
-        },
-        cache: { cacheLocation: "localStorage" },
+      const notifyPayload = {
+        type: "notify_gratas",
+        sentAt: nowIso(),
+        ...body,
+        list: body.attachments.map((a) => ({
+          messageId: a.messageId,
+          attachmentId: a.attachmentId,
+          sheetName: a.sheetName || "",
+          outlookName: a.outlookName || "",
+          contentType: a.contentType || "",
+        })),
       };
 
-      // keep minimal scopes
-      const loginRequest = { scopes: ["openid", "profile", "offline_access", "Mail.Read"] };
-
-      const msalInstance = new msal.PublicClientApplication(msalConfig);
-      if (typeof msalInstance.initialize === "function") await msalInstance.initialize();
-
-      // ✅ Handle redirect response FIRST (same-tab flow returns here)
-      try {
-        setStatus("Finishing login…", null);
-        const resp = await msalInstance.handleRedirectPromise();
-        if (resp?.account) msalInstance.setActiveAccount?.(resp.account);
-      } catch (e) {
-        showBanner("handleRedirectPromise error:\n" + (e?.message || String(e)));
-      }
-
-      function setUiFromAccount() {
-        const active = msalInstance.getActiveAccount?.() || null;
-        const accounts = msalInstance.getAllAccounts();
-        const picked = active || accounts[0] || null;
-
-        if (picked) {
-          msalInstance.setActiveAccount?.(picked);
-          setStatus(`Logged in: ${picked.username}`, true);
-          btnCheck.disabled = false;
-        } else {
-          setStatus("Ready (not logged in)", null);
-          btnCheck.disabled = true;
-        }
-      }
-
-      setUiFromAccount();
-
-      async function login() {
-        hideBanner();
-        setStatus("Redirecting to Microsoft login…", null);
-        // ✅ same-tab login (redirect)
-        await msalInstance.loginRedirect(loginRequest);
-      }
-
-      async function getToken() {
-        const acct = msalInstance.getActiveAccount?.() || msalInstance.getAllAccounts()[0];
-        if (!acct) throw new Error("Not logged in.");
-        msalInstance.setActiveAccount?.(acct);
-
-        try {
-          const resp = await msalInstance.acquireTokenSilent({ ...loginRequest, account: acct });
-          return resp.accessToken;
-        } catch (e) {
-          // ✅ same-tab token prompt (redirect)
-          await msalInstance.acquireTokenRedirect({ ...loginRequest, account: acct });
-          // execution stops here because browser navigates away
-          throw new Error("Redirecting for token…");
-        }
-      }
-
-      btnLogin.addEventListener("click", (e) => { e.preventDefault(); login(); });
-
-      btnCheck.addEventListener("click", async () => {
-        btnSend.disabled = true;
-        hideBanner();
-        setStatus("Checking…", null);
-        summaryCard.style.display = 'none';
-        detailsCard.style.display = 'none';
-
-        try {
-          const date = dateEl.value;
-          const token = await getToken();
-
-          const res = await fetch(`/api/check?date=${encodeURIComponent(date)}&debug=1`, {
-            headers: { Authorization: `Bearer ${token}` },
-          });
-
-          const data = await res.json().catch(() => ({}));
-          lastCheck = data;
-
-          summaryCard.style.display = 'block';
-          detailsCard.style.display = 'block';
-
-          if (!res.ok || data.error) {
-            setStatus("ERROR ❌", false);
-            summaryEl.innerHTML = `<div class="bad">${escapeHtml(data.error || "Request failed")}</div>`;
-            payloadEl.textContent = JSON.stringify(data, null, 2);
-            detailsEl.innerHTML = '';
-            return;
-          }
-
-          summaryEl.innerHTML = `
-            <div class="row">
-              <div><b>Date:</b> ${data.date}</div>
-              <div><b>Outlook attachments:</b> ${data.outlook_attachments_total}</div>
-              <div><b>Sheets attachments:</b> ${data.sheets_attachments_total}</div>
-              <div><b>Missing:</b> ${data.missing_count}</div>
-              <div><b>Extra:</b> ${data.extra_count}</div>
-            </div>
-          `;
-
-          payloadEl.textContent = JSON.stringify(data.payload || {}, null, 2);
-
-          detailsEl.innerHTML = `
-            <div class="row">
-              <div><b>Status:</b> <span class="${data.ready ? 'ok' : 'bad'}">${data.ready ? 'READY ✅' : 'NOT READY ❌'}</span></div>
-              <div class="muted">READY only when Missing=0 and Extra=0</div>
-            </div>
-
-            <h4>Missing:</h4>
-            ${renderKeyTable(data.missing)}
-
-            <h4>Extra:</h4>
-            ${renderKeyTable(data.extra)}
-
-            <h4>Debug logs</h4>
-            <pre>${escapeHtml(JSON.stringify(data.logs || [], null, 2))}</pre>
-          `;
-
-          setStatus(data.ready ? "READY ✅" : "NOT READY ❌", data.ready);
-          btnSend.disabled = !data.ready;
-
-        } catch (e) {
-          // If we triggered acquireTokenRedirect, the page will navigate away; no need to show error
-          const msg = String(e?.message || e);
-          if (msg.includes("Redirecting for token")) return;
-
-          setStatus("ERROR ❌", false);
-          showBanner(msg);
-        }
+      const meta = await fetchWithMeta(webhookUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(notifyPayload),
       });
 
-      btnSend.addEventListener("click", async () => {
-        if (!lastCheck?.ready) return;
-        setStatus("Sending…", null);
-        btnSend.disabled = true;
-        hideBanner();
+      logs.push({ t: nowIso(), step: "n8n.notify", url: webhookUrl, status: meta.status, ok: meta.ok });
 
-        try {
-          const res = await fetch('/api/check?trigger=1&debug=1', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(lastCheck.payload),
-          });
+      if (!meta.ok) {
+        return res.status(502).json({
+          ok: false,
+          error: `n8n notify webhook failed ${meta.status}: ${safeTruncate(meta.text)}`,
+          ...(debug ? { logs } : {}),
+        });
+      }
 
-          const out = await res.json().catch(() => ({}));
-
-          if (res.ok && out.ok) setStatus("Sent ✅", true);
-          else {
-            setStatus("Send failed ❌", false);
-            showBanner(out.error || `Send failed (${res.status})`);
-            btnSend.disabled = false;
-          }
-        } catch (e) {
-          setStatus("Send failed ❌", false);
-          showBanner(e?.message || String(e));
-          btnSend.disabled = false;
-        }
+      return res.status(200).json({
+        ok: true,
+        status: meta.status,
+        response: meta.json ?? meta.text,
+        ...(debug ? { logs } : {}),
       });
     }
 
-    bootMsal();
-  </script>
-</body>
-</html>
+    // ✅ Normal verifier
+    const date = String(req.query.date || "").trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      return res.status(400).json({ ok: false, error: "Invalid date. Use YYYY-MM-DD" });
+    }
+
+    const mailbox = process.env.MAILBOX || "invoices@ikrautas.lt";
+    const spreadsheetId = process.env.SHEET_ID;
+    const recognizedTab = process.env.SHEET_RECOGNIZED_TAB || "Atpažintos saskaitos";
+    const unrecognizedTab = process.env.SHEET_UNRECOGNIZED_TAB || "Neatpažintos saskaitos";
+    if (!spreadsheetId) throw new Error("Missing SHEET_ID");
+
+    const bearer = getBearerFromReq(req);
+    const mode = bearer ? "delegated" : "app_only";
+
+    let token;
+    if (bearer) {
+      token = bearer;
+      logs.push({ t: nowIso(), step: "graph.token.delegated.claims", claims: decodeJwtClaims(token) });
+    } else {
+      token = await getGraphTokenAppOnly(logs);
+    }
+
+    const outlook = await getExpectedOutlookKeys({ mailbox, date, logs, token, mode });
+    const sheets = await getSheetAttachmentsForDate({ spreadsheetId, recognizedTab, unrecognizedTab, date, logs });
+
+    const expectedSet = new Map();
+    for (const e of outlook.expected_unique) expectedSet.set(`${e.messageId}::${e.attachmentId}`, e);
+
+    const sheetsSet = new Map();
+    for (const s of sheets.unique) sheetsSet.set(`${s.messageId}::${s.attachmentId}`, s);
+
+    const missing = [];
+    for (const [k, e] of expectedSet.entries()) if (!sheetsSet.has(k)) missing.push(e);
+
+    const extra = [];
+    for (const [k, s] of sheetsSet.entries()) if (!expectedSet.has(k)) extra.push(s);
+
+    const ready = missing.length === 0 && extra.length === 0 && sheets.sheets_rows_missing_ids === 0;
+
+    // ✅ Payload for n8n: messageId + attachmentId (PDF invoices only)
+    const attachments = [];
+    for (const [k, s] of sheetsSet.entries()) {
+      const e = expectedSet.get(k);
+      if (!e) continue;
+      if (!e.isPdf) continue; // invoices only
+      attachments.push({
+        messageId: e.messageId,
+        attachmentId: e.attachmentId,
+        outlookName: e.name || "",
+        contentType: e.contentType || "",
+        sheetName: s.name || "",
+      });
+    }
+
+    const payload = {
+      date,
+      mailbox,
+      mode,
+      usedBase: outlook.usedBase,
+      attachments,
+    };
+
+    return res.status(200).json({
+      ok: true,
+      date,
+      ready,
+      mode,
+      mailbox,
+      usedBase: outlook.usedBase,
+      messages_count: outlook.messages_count,
+
+      outlook_attachments_total: outlook.expected_unique.length,
+      sheets_attachments_total: sheets.sheets_total_rows_by_date,
+      recognized_attachments: sheets.recognized.totalRowsByDate,
+      unrecognized_attachments: sheets.unrecognized.totalRowsByDate,
+
+      sheets_rows_missing_ids: sheets.sheets_rows_missing_ids,
+
+      missing_count: missing.length,
+      extra_count: extra.length,
+
+      missing: missing.map((x) => ({
+        messageId: x.messageId,
+        attachmentId: x.attachmentId,
+        name: x.name,
+        contentType: x.contentType,
+        isPdf: x.isPdf,
+        isInline: x.isInline,
+      })),
+      extra,
+
+      payload,
+
+      ...(debug ? { logs } : {}),
+    });
+  } catch (err) {
+    const errorMsg = String(err?.message || err);
+    const status = err?.__httpStatus || 500;
+    logs.push({ t: nowIso(), step: "error", message: errorMsg, status });
+
+    return res.status(status).json({
+      ok: false,
+      error: errorMsg,
+      ...(debug ? { logs } : {}),
+    });
+  }
+}
