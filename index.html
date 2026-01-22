@@ -23,6 +23,10 @@
     .btn-primary:disabled, .btn-secondary:disabled { opacity:0.5; cursor:not-allowed; }
     .small { font-size:12px; }
     .banner { display:none; border:1px solid #ffd6d6; background:#fff3f3; color:#7a0010; padding:12px; border-radius:10px; margin-top:12px; white-space:pre-wrap; }
+
+    /* ✅ tiny inline button style for section headers */
+    .hrow { display:flex; align-items:center; gap:10px; margin-top: 14px; }
+    .hrow h4 { margin: 0; }
   </style>
 
   <!-- MSAL primary CDN -->
@@ -65,9 +69,6 @@
     <button class="btn-secondary" id="btnCheck" disabled>Check batch</button>
     <button class="btn-primary" id="btnSend" disabled>Send to n8n</button>
 
-    <!-- ✅ Only shown when NOT READY + (Missing>0 OR Extra>0) -->
-    <button class="btn-secondary" id="btnGratas" style="display:none;" disabled>Send to Gratas</button>
-
     <span id="statusPill" class="pill muted">Booting…</span>
   </div>
 
@@ -107,7 +108,6 @@
     const btnLogin = document.getElementById('btnLogin');
     const btnCheck = document.getElementById('btnCheck');
     const btnSend = document.getElementById('btnSend');
-    const btnGratas = document.getElementById('btnGratas');
     const statusPill = document.getElementById('statusPill');
 
     const summaryCard = document.getElementById('summaryCard');
@@ -121,19 +121,12 @@
       statusPill.className = 'pill ' + (ok === true ? 'ok' : ok === false ? 'bad' : 'muted');
     }
 
-    // ✅ show/hide + enable/disable Gratas button based on mismatch
-    function setGratasButtonVisible(visible, enabled) {
-      btnGratas.style.display = visible ? '' : 'none';
-      btnGratas.disabled = !enabled;
-    }
-
     setStatus("JS loaded ✅", null);
 
     const now = new Date();
     dateEl.value = `${now.getUTCFullYear()}-${String(now.getUTCMonth()+1).padStart(2,'0')}-${String(now.getUTCDate()).padStart(2,'0')}`;
 
     let lastCheck = null;
-    let lastGratasPayload = null;
 
     function escapeHtml(s) {
       return String(s).replace(/[&<>"']/g, c => ({
@@ -156,6 +149,42 @@
           <tbody>${rows}</tbody>
         </table>
         ${list.length > 200 ? `<div class="muted">Showing first 200 of ${list.length}</div>` : ''}`;
+    }
+
+    // ✅ Build payload for webhook from a list (missing or extra)
+    function buildGratasPayload(kind, date, list) {
+      return {
+        kind, // "missing" | "extra"
+        at: new Date().toISOString(),
+        date,
+        count: Array.isArray(list) ? list.length : 0,
+        items: (Array.isArray(list) ? list : []).map(x => ({
+          messageId: x?.messageId ?? null,
+          attachmentId: x?.attachmentId ?? null,
+          name: x?.name ?? null,
+          contentType: x?.contentType ?? null,
+        })),
+      };
+    }
+
+    // ✅ POST to webhook (used by both Missing and Extra buttons)
+    async function postToGratasWebhook(payload) {
+      if (!GRATAS_WEBHOOK_URL || GRATAS_WEBHOOK_URL.includes("YOUR_WEBHOOK_URL_HERE")) {
+        showBanner("Set GRATAS_WEBHOOK_URL in index.html to your webhook endpoint first.");
+        throw new Error("Missing webhook URL");
+      }
+
+      const res = await fetch(GRATAS_WEBHOOK_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+
+      const text = await res.text().catch(() => "");
+      if (!res.ok) {
+        throw new Error(`Webhook failed (${res.status}).\n${text || "(no body)"}`);
+      }
+      return { ok: true, text };
     }
 
     async function bootMsal() {
@@ -194,7 +223,6 @@
         btnLogin.disabled = true;
         btnCheck.disabled = true;
         btnSend.disabled = true;
-        setGratasButtonVisible(false, false);
         return;
       }
 
@@ -262,8 +290,6 @@
 
       btnCheck.addEventListener("click", async () => {
         btnSend.disabled = true;
-        setGratasButtonVisible(false, false);
-        lastGratasPayload = null;
 
         hideBanner();
         setStatus("Checking…", null);
@@ -289,7 +315,6 @@
             summaryEl.innerHTML = `<div class="bad">${escapeHtml(data.error || "Request failed")}</div>`;
             payloadEl.textContent = JSON.stringify(data, null, 2);
             detailsEl.innerHTML = '';
-            setGratasButtonVisible(false, false);
             return;
           }
 
@@ -305,39 +330,18 @@
 
           payloadEl.textContent = JSON.stringify(data.payload || {}, null, 2);
 
-          const missingCount = Number(data.missing_count || 0);
-          const extraCount = Number(data.extra_count || 0);
+          const missing = Array.isArray(data.missing) ? data.missing : [];
+          const extra = Array.isArray(data.extra) ? data.extra : [];
 
-          // ✅ show ONLY when NOT READY AND mismatch exists
-          const hasMismatch = (missingCount > 0) || (extraCount > 0);
-          const showGratas = (!data.ready) && hasMismatch;
+          // ✅ show "Send to Gratas" buttons ONLY when those lists have items
+          const missingBtnHtml = missing.length > 0 ? `
+            <button class="btn-secondary small" id="btnGratasMissing">Send to Gratas</button>
+            <span class="muted small">Sends ONLY missing ids + names to webhook</span>
+          ` : '';
 
-          setGratasButtonVisible(showGratas, showGratas);
-
-          // ✅ This is what will be POSTed to your webhook
-          lastGratasPayload = showGratas ? {
-            kind: "invoice_batch_mismatch",
-            at: new Date().toISOString(),
-            date: data.date,
-            mailbox: data.mailbox || null,
-            mode: data.mode || null,
-            usedBase: data.usedBase || null,
-            summary: {
-              outlook_attachments_total: data.outlook_attachments_total,
-              sheets_attachments_total: data.sheets_attachments_total,
-              missing_count: missingCount,
-              extra_count: extraCount,
-            },
-            missing: Array.isArray(data.missing) ? data.missing : [],
-            extra: Array.isArray(data.extra) ? data.extra : [],
-          } : null;
-
-          const gratasSection = showGratas ? `
-            <h4>Send to Gratas:</h4>
-            <div class="muted small">
-              Sends the mismatch list to a webhook (messageId + attachmentId + name).
-              <br/>Webhook: <span class="pill small">${escapeHtml(GRATAS_WEBHOOK_URL || "(set GRATAS_WEBHOOK_URL)")}</span>
-            </div>
+          const extraBtnHtml = extra.length > 0 ? `
+            <button class="btn-secondary small" id="btnGratasExtra">Send to Gratas</button>
+            <span class="muted small">Sends ONLY extra ids + names to webhook</span>
           ` : '';
 
           detailsEl.innerHTML = `
@@ -346,13 +350,17 @@
               <div class="muted">READY only when Missing=0 and Extra=0</div>
             </div>
 
-            <h4>Missing:</h4>
-            ${renderKeyTable(data.missing)}
+            <div class="hrow">
+              <h4>Missing:</h4>
+              ${missingBtnHtml}
+            </div>
+            ${renderKeyTable(missing)}
 
-            <h4>Extra:</h4>
-            ${renderKeyTable(data.extra)}
-
-            ${gratasSection}
+            <div class="hrow">
+              <h4>Extra:</h4>
+              ${extraBtnHtml}
+            </div>
+            ${renderKeyTable(extra)}
 
             <h4>Debug logs</h4>
             <pre>${escapeHtml(JSON.stringify(data.logs || [], null, 2))}</pre>
@@ -361,14 +369,65 @@
           setStatus(data.ready ? "READY ✅" : "NOT READY ❌", data.ready);
           btnSend.disabled = !data.ready;
 
+          // ✅ wire up the two buttons (they only exist when lists > 0)
+          const btnMissing = document.getElementById("btnGratasMissing");
+          if (btnMissing) {
+            btnMissing.addEventListener("click", async (e) => {
+              e.preventDefault();
+              hideBanner();
+
+              const payload = buildGratasPayload("missing", data.date, missing);
+
+              try {
+                setStatus("Sending Missing to Gratas…", null);
+                btnMissing.disabled = true;
+
+                await postToGratasWebhook(payload);
+
+                setStatus("Missing sent ✅", true);
+              } catch (err) {
+                setStatus("Webhook failed ❌", false);
+                showBanner(
+                  (err?.message || String(err)) +
+                  "\n\nIf this is a CORS error: allow CORS on webhook or proxy via your backend."
+                );
+                btnMissing.disabled = false;
+              }
+            });
+          }
+
+          const btnExtra = document.getElementById("btnGratasExtra");
+          if (btnExtra) {
+            btnExtra.addEventListener("click", async (e) => {
+              e.preventDefault();
+              hideBanner();
+
+              const payload = buildGratasPayload("extra", data.date, extra);
+
+              try {
+                setStatus("Sending Extra to Gratas…", null);
+                btnExtra.disabled = true;
+
+                await postToGratasWebhook(payload);
+
+                setStatus("Extra sent ✅", true);
+              } catch (err) {
+                setStatus("Webhook failed ❌", false);
+                showBanner(
+                  (err?.message || String(err)) +
+                  "\n\nIf this is a CORS error: allow CORS on webhook or proxy via your backend."
+                );
+                btnExtra.disabled = false;
+              }
+            });
+          }
+
         } catch (e) {
           const msg = String(e?.message || e);
           if (msg.includes("Redirecting for token")) return;
 
           setStatus("ERROR ❌", false);
           showBanner(msg);
-          setGratasButtonVisible(false, false);
-          lastGratasPayload = null;
         }
       });
 
@@ -376,7 +435,6 @@
         if (!lastCheck?.ready) return;
         setStatus("Sending…", null);
         btnSend.disabled = true;
-        setGratasButtonVisible(false, false);
         hideBanner();
 
         try {
@@ -398,44 +456,6 @@
           setStatus("Send failed ❌", false);
           showBanner(e?.message || String(e));
           btnSend.disabled = false;
-        }
-      });
-
-      // ✅ Send to Gratas -> POST mismatch list to webhook
-      btnGratas.addEventListener("click", async () => {
-        if (!lastGratasPayload) return;
-
-        if (!GRATAS_WEBHOOK_URL || GRATAS_WEBHOOK_URL.includes("YOUR_WEBHOOK_URL_HERE")) {
-          showBanner("Set GRATAS_WEBHOOK_URL in index.html to your webhook endpoint first.");
-          return;
-        }
-
-        setStatus("Sending to Gratas…", null);
-        btnGratas.disabled = true;
-        hideBanner();
-
-        try {
-          const res = await fetch(GRATAS_WEBHOOK_URL, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(lastGratasPayload),
-          });
-
-          const text = await res.text().catch(() => "");
-          if (res.ok) {
-            setStatus("Sent to Gratas ✅", true);
-          } else {
-            setStatus("Webhook failed ❌", false);
-            showBanner(`Webhook failed (${res.status}).\n${text || "(no body)"}`);
-            btnGratas.disabled = false;
-          }
-        } catch (e) {
-          setStatus("Webhook failed ❌", false);
-          showBanner(
-            (e?.message || String(e)) +
-            "\n\nIf this is a CORS error: your webhook must allow CORS, OR you must proxy this request through your backend."
-          );
-          btnGratas.disabled = false;
         }
       });
     }
