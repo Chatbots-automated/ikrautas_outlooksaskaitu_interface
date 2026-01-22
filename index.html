@@ -64,7 +64,7 @@
     <button class="btn-secondary" id="btnLogin">Login (Microsoft)</button>
     <button class="btn-secondary" id="btnCheck" disabled>Check batch</button>
     <button class="btn-primary" id="btnSend" disabled>Send to n8n</button>
-    <button class="btn-secondary" id="btnGratas" disabled>Send to Gratas</button>
+    <button class="btn-secondary" id="btnGratas" style="display:none;" disabled>Send to Gratas</button>
 
     <span id="statusPill" class="pill muted">Booting…</span>
   </div>
@@ -115,6 +115,12 @@
     }
     function hideBanner(){ banner.style.display='none'; banner.textContent=''; }
 
+    // ✅ show/hide + enable/disable Gratas button based on missing/extra
+    function setGratasButtonVisible(visible, enabled) {
+      btnGratas.style.display = visible ? '' : 'none';
+      btnGratas.disabled = !enabled;
+    }
+
     setStatus("JS loaded ✅", null);
 
     const now = new Date();
@@ -145,7 +151,7 @@
         ${list.length > 200 ? `<div class="muted">Showing first 200 of ${list.length}</div>` : ''}`;
     }
 
-    // ✅ NEW: show the exact attachments that will be emailed to Gratas (from payload.attachments)
+    // show the exact attachments that will be emailed to Gratas (from payload.attachments)
     function renderAttachmentsTableFromPayload(payload) {
       const list = payload?.attachments || [];
       if (!Array.isArray(list) || list.length === 0) return '<div class="muted">None</div>';
@@ -202,7 +208,7 @@
         btnLogin.disabled = true;
         btnCheck.disabled = true;
         btnSend.disabled = true;
-        btnGratas.disabled = true;
+        setGratasButtonVisible(false, false);
         return;
       }
 
@@ -211,19 +217,16 @@
           clientId: MS_CLIENT_ID,
           authority: `https://login.microsoftonline.com/${MS_TENANT_ID}`,
           redirectUri: window.location.origin + "/",
-          // ✅ helps keep navigation in the same tab for redirect flows
           navigateToLoginRequestUrl: false,
         },
         cache: { cacheLocation: "localStorage" },
       };
 
-      // keep minimal scopes
       const loginRequest = { scopes: ["openid", "profile", "offline_access", "Mail.Read"] };
 
       const msalInstance = new msal.PublicClientApplication(msalConfig);
       if (typeof msalInstance.initialize === "function") await msalInstance.initialize();
 
-      // ✅ Handle redirect response FIRST (same-tab flow returns here)
       try {
         setStatus("Finishing login…", null);
         const resp = await msalInstance.handleRedirectPromise();
@@ -252,7 +255,6 @@
       async function login() {
         hideBanner();
         setStatus("Redirecting to Microsoft login…", null);
-        // ✅ same-tab login (redirect)
         await msalInstance.loginRedirect(loginRequest);
       }
 
@@ -265,9 +267,7 @@
           const resp = await msalInstance.acquireTokenSilent({ ...loginRequest, account: acct });
           return resp.accessToken;
         } catch (e) {
-          // ✅ same-tab token prompt (redirect)
           await msalInstance.acquireTokenRedirect({ ...loginRequest, account: acct });
-          // execution stops here because browser navigates away
           throw new Error("Redirecting for token…");
         }
       }
@@ -276,7 +276,8 @@
 
       btnCheck.addEventListener("click", async () => {
         btnSend.disabled = true;
-        btnGratas.disabled = true;
+        setGratasButtonVisible(false, false);
+
         hideBanner();
         setStatus("Checking…", null);
         summaryCard.style.display = 'none';
@@ -301,6 +302,7 @@
             summaryEl.innerHTML = `<div class="bad">${escapeHtml(data.error || "Request failed")}</div>`;
             payloadEl.textContent = JSON.stringify(data, null, 2);
             detailsEl.innerHTML = '';
+            setGratasButtonVisible(false, false);
             return;
           }
 
@@ -316,11 +318,14 @@
 
           payloadEl.textContent = JSON.stringify(data.payload || {}, null, 2);
 
-          // ✅ NEW: When READY, show "Send to Gratas" section with the actual attachments list (payload.attachments)
-          const gratasSection = data.ready ? `
+          // ✅ CHANGE: Show "Send to Gratas" ONLY when NOT READY because Missing>0 OR Extra>0
+          const hasMismatch = (Number(data.missing_count || 0) > 0) || (Number(data.extra_count || 0) > 0);
+          setGratasButtonVisible(hasMismatch, hasMismatch);
+
+          const gratasSection = hasMismatch ? `
             <h4>Send to Gratas:</h4>
             <div class="muted small">
-              Sends an email containing the list of attachments (messageId + attachmentId + file name). This is for reassurance.
+              Sends an email containing the list of invoice attachments (messageId + attachmentId + file name). Useful for troubleshooting / reassurance.
             </div>
             ${renderAttachmentsTableFromPayload(data.payload)}
           ` : '';
@@ -345,15 +350,14 @@
 
           setStatus(data.ready ? "READY ✅" : "NOT READY ❌", data.ready);
           btnSend.disabled = !data.ready;
-          btnGratas.disabled = !data.ready;
 
         } catch (e) {
-          // If we triggered acquireTokenRedirect, the page will navigate away; no need to show error
           const msg = String(e?.message || e);
           if (msg.includes("Redirecting for token")) return;
 
           setStatus("ERROR ❌", false);
           showBanner(msg);
+          setGratasButtonVisible(false, false);
         }
       });
 
@@ -361,7 +365,7 @@
         if (!lastCheck?.ready) return;
         setStatus("Sending…", null);
         btnSend.disabled = true;
-        btnGratas.disabled = true;
+        setGratasButtonVisible(false, false);
         hideBanner();
 
         try {
@@ -378,19 +382,17 @@
             setStatus("Send failed ❌", false);
             showBanner(out.error || `Send failed (${res.status})`);
             btnSend.disabled = false;
-            btnGratas.disabled = !lastCheck?.ready;
           }
         } catch (e) {
           setStatus("Send failed ❌", false);
           showBanner(e?.message || String(e));
           btnSend.disabled = false;
-          btnGratas.disabled = !lastCheck?.ready;
         }
       });
 
-      // ✅ NEW: Send to Gratas -> calls backend notify endpoint (you already added /api/check?notify=1)
+      // Send to Gratas -> calls backend notify endpoint
       btnGratas.addEventListener("click", async () => {
-        if (!lastCheck?.ready) return;
+        if (!lastCheck) return;
 
         setStatus("Emailing Gratas…", null);
         btnGratas.disabled = true;
